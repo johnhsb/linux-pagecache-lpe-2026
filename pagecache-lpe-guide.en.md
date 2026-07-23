@@ -2,7 +2,7 @@
 
 **Target CVEs**: CVE-2026-31431 (Copy Fail), CVE-2026-43284/CVE-2026-43500 (Dirty Frag), CVE-2026-46300 (Fragnesia), CVE-2026-43503 (DirtyClone), CVE-2026-46331 (pedit COW), CVE-2026-43494 (PinTheft), CVE-2026-31694 (FUSE directory-cache overflow) — 8 CVEs total
 
-**Purpose**: explain the technical root cause and shared traits of these 8 vulnerabilities that misuse the page cache as an in-place write target, document how to apply the official patches and what to watch for, and provide a safe procedure for using the [mitigate-cve-2026.sh](mitigate-cve-2026.sh) mitigation script on production systems that cannot patch immediately. **The script only automates 5 of the 8** (31431/43284/43500/46300/43503) — the other 3 have manual-only mitigation steps in section 5.6.
+**Purpose**: explain the technical root cause and shared traits of these 8 vulnerabilities that misuse the page cache as an in-place write target, document how to apply the official patches and what to watch for, and provide a safe procedure for using the [mitigate-cve-2026.sh](mitigate-cve-2026.sh) mitigation script on production systems that cannot patch immediately. **The script automates 6 of the 8** (31431/43284/43500/46300/43503/46331) — the other 2 (PinTheft, FUSE) have manual-only mitigation steps in section 5.6.
 
 **Audience**: system/security operators, and whoever will apply this script to production servers.
 
@@ -19,8 +19,8 @@
   - ⚪ **Other (low likelihood right now)**: PinTheft (43494) — the RDS module isn't compiled into most distro kernels by default. FUSE cache overflow (31694) — requires kernel 6.16-rc1+, so RHEL and other major distros are entirely unaffected as of now. (section 1.1)
 - **"We patched" only guarantees safety if all the relevant commits are present.** Fragnesia (46300) in particular is a separate, pre-existing flaw that only becomes exploitable once the 43284 patch is applied — **a kernel with 43284 but not 46300 can be more exposed than one with neither.** DirtyClone (43503) requires the entire "DirtyFrag + Fragnesia chain" for full protection (section 2.4, section 4.1).
 - **Comparing `uname -r` version numbers alone cannot tell you if you're patched.** Distros frequently keep the upstream version string while backporting only the security fix. Check the CVE ID directly against your distro's advisories (section 4.2).
-- **More RHEL/CentOS exemptions now.** Beyond 43500 (RxRPC), **both 43494 (PinTheft) and 31694 (FUSE) are officially not affected across RHEL 6–10.** Conversely, 46331 (pedit COW) does affect RHEL 8/9/10. The rest are mostly affected, and the `el9_7`/`el10_1` minor streams in particular never received fixes for 46300/43503 — **updating packages within the same stream is not enough; you must switch minor streams** (section 4.4).
-- **A real patch is the only complete fix; the mitigation script is a stopgap until then.** The module-blocking approach in [mitigate-cve-2026.sh](mitigate-cve-2026.sh) is the exact procedure Red Hat documents in RHSB-2026-003 / RHSB-2026-008. That said, DirtyClone's root cause lives in the kernel core, so blocking modules only closes the confirmed trigger (esp4/esp6) — and **the script itself does not yet automate pedit COW, PinTheft, or FUSE** (section 5, section 5.6).
+- **More RHEL exemptions now, but don't generalize them to "RHEL family."** Beyond 43500 (RxRPC), **both 43494 (PinTheft) and 31694 (FUSE) are officially not affected on RHEL itself (RHEL 6–10).** But that doesn't extend to every RHEL-derived distro — **Oracle Linux (UEK) is directly verified to ship `CONFIG_RDS=m`**, so PinTheft *does* apply there (section 2.7). Conversely, 46331 (pedit COW) does affect RHEL 8/9/10. The rest are mostly affected, and the `el9_7`/`el10_1` minor streams in particular never received fixes for 46300/43503 — **updating packages within the same stream is not enough; you must switch minor streams** (section 4.4).
+- **A real patch is the only complete fix; the mitigation script is a stopgap until then.** The module-blocking approach in [mitigate-cve-2026.sh](mitigate-cve-2026.sh) is the exact procedure Red Hat documents in RHSB-2026-003 / RHSB-2026-008. That said, DirtyClone's root cause lives in the kernel core, so blocking modules only closes the confirmed trigger (esp4/esp6) — and **PinTheft and FUSE are not yet automated by the script** (section 5, section 5.6).
 
 ---
 
@@ -30,7 +30,7 @@
 - **Vendor advisories, RHSA numbers, and package versions are all snapshots re-verified on 2026-07-22.** In particular, verify the RHSA numbers and build versions in section 4.4 directly against the erratum page before rolling out in production.
 - **Oracle Linux 9 (UEK) has no published advisory for CVE-2026-43503 as of 2026-07.** Even the latest UEK kernel may still be unpatched for this CVE.
 - **CentOS Linux 7/8 (the traditional CentOS, now EOL) will not receive official patches for any of the original 5 CVEs.** Migrating to AlmaLinux/Rocky, or paying for ELS, is effectively the only remaining path (section 4.4).
-- **The "Other" classification for PinTheft (43494) and FUSE (31694) reflects current default distro configurations.** A system that enables RDS (e.g. some cluster/HPC environments) or already tracks kernel 6.16+ should re-rate these higher for its own fleet (section 2.6, section 2.8).
+- **"RHEL family, so not affected" doesn't hold without checking the specific distro.** PinTheft (43494) is not affected on RHEL proper and CloudLinux, but **is affected on Oracle Linux (UEK)** — verified directly on 2026-07-23 (`CONFIG_RDS=m`/`CONFIG_RDS_RDMA=m`/`CONFIG_RDS_TCP=m`). RDS was built by Oracle for RAC database interconnects, so this was a predictable gap that an earlier version of this guide missed by generalizing across "RHEL family" without checking (section 2.7, section 4.4).
 - **pedit COW's (46331) CVSS differs by scoring authority in how they judge the privilege requirement (`PR`)** — kernel.org rates it `PR:L` (7.8), Red Hat rates it lower at `PR:H` (6.7). For an operational decision, go by "can CAP_NET_ADMIN be acquired via an unprivileged namespace" rather than the score alone (section 2.7).
 - **Secondary sources — and even primary sources — disagree with each other in places.** This document always favored primary sources (OSV, Red Hat Security Data API) — e.g. RxRPC's vulnerable-since version (OSV/NVD's `5.3` vs. some blogs' "since ~2023"), Fragnesia's nature (a pre-existing flaw since 3.9, not a regression caused by the 43284 patch), and the CVSS vectors for CVE-2026-43284/43503/43494 (OSV/kernel.org vs. Red Hat's own vector disagree — see the footnote in section 4.3 and the appendix). If this matters to a decision, re-query the primary source directly.
 - **A kernel whose changelog has no CVE ID** cannot be distinguished, from local information alone, between "not yet patched" and "this distro just doesn't record CVE IDs" (section 4.2). Use `--online` or a manual advisory lookup to resolve this.
@@ -47,7 +47,7 @@
 | CVE-2026-43500 | Dirty Frag (RxRPC) | RxRPC protocol processing | `rxrpc` | 7.8 | 2026-05-07 | 2026-05-11 | ✅ | Separate commit from ESP (different subsystem, independent patch required) |
 | CVE-2026-46300 | Fragnesia | ESP path (`skb_try_coalesce()`) | `esp4`, `esp6` | 7.8 | 2026-05-13 | 2026-05-23 | ✅ | Independent patch fixing a path distinct from 43284 |
 | CVE-2026-43503 | DirtyClone | skb clone path (kernel core) | Triggered via `esp4`, `esp6` | 8.8 (Red Hat rating 7.0) | 2026-06-25 | 2026-05-23 | ✅ | Mainline merge 2026-05-21, included in upstream v7.1-rc5 (2026-05-24) |
-| CVE-2026-46331 | pedit COW | tc (traffic control) `act_pedit` | `act_pedit` | 7.8 (kernel.org) / 6.7 (Red Hat) | 2026-06-16 | 2026-06-16 | ❌ (manual, section 5.6) | v7.1-rc7 (introduced by 899ee91156e5, fixed by 2bec122b9fb9 and others) |
+| CVE-2026-46331 | pedit COW | tc (traffic control) `act_pedit` | `act_pedit` | 7.8 (kernel.org) / 6.7 (Red Hat) | 2026-06-16 | 2026-06-16 | ✅ (since v2.8.0) | v7.1-rc7 (introduced by 899ee91156e5, fixed by 2bec122b9fb9 and others) |
 | CVE-2026-43494 | PinTheft | RDS zerocopy + io_uring | `rds`, `rds_tcp`, `rds_rdma` | 7.8 (kernel.org) / 7.0 (Red Hat) | 2026-05-21 | 2026-05-21 | ❌ (manual, section 5.6) | 8 stable-branch patches (c6e51512a784 and others) |
 | CVE-2026-31694 | (FUSE cache overflow) | FUSE directory-entry caching | `fuse` | 7.8 (kernel.org) | 2026-05-01 (NVD) / 2026-07-10 (press coverage spread) | 2026-05-01 | ❌ (manual, section 5.6) | 474ce83c96a5 and others (only reachable from 6.16-rc1 onward) |
 
@@ -127,17 +127,19 @@
 - **Affected versions**: v5.18 through v7.1-rc6 (introduced by commit `899ee91156e5`), fixed in v7.1-rc7.
 - **Vendor response**: Red Hat published a dedicated **RHSB-2026-008** (rated Important). Both module blocking (`act_pedit`) and unprivileged-namespace restriction are officially documented as mitigations — the same pattern as RHSB-2026-003.
 - **CVSS disagreement**: kernel.org rates it 7.8 (`PR:L`) vs. Red Hat's 6.7 (`PR:H`) — the two disagree on the privilege-requirement level. For an operational decision, go by "can CAP_NET_ADMIN be acquired via an unprivileged namespace" rather than the CVSS number alone.
-- **Script support**: [mitigate-cve-2026.sh](mitigate-cve-2026.sh) in this repository does not yet handle `act_pedit`. See section 5.6 for manual mitigation.
+- **Script support**: [mitigate-cve-2026.sh](mitigate-cve-2026.sh) in this repository automates `act_pedit` — autoload blocking and unload work the same way as esp4/esp6/rxrpc/algif_aead, plus a dedicated tc-pedit usage-signal check (`tc actions show action pedit`) (section 5.1). Verified the diagnosis (`--dry-run --verbose`) path on a real Oracle Linux 9.8 UEK host — that host already had 46331 patched, so the actual block/unload/rollback path wasn't exercised for this specific CVE there; that part relies on the same generic, array-driven logic already verified end-to-end with esp4/esp6.
 
 ### 2.7 PinTheft (CVE-2026-43494)
 
 - **Disclosure**: 2026-05-21 (NVD).
 - **Path**: the combination of the RDS (Reliable Datagram Sockets) zerocopy path and io_uring fixed buffers (`IORING_REGISTER_CLONE_BUFFERS`, kernel 6.13+). Related modules: `rds`/`rds_tcp`/`rds_rdma`.
 - **Root cause**: when `iov_iter_get_pages2()` fails inside `rds_message_zcopy_from_user()`, the pinned pages are released, but the `op_nents` counter isn't reset — so `rds_message_purge()`'s later cleanup loop frees the same page again, a **double-free** (CWE-1341). Chaining this double-free with io_uring fixed buffers lets an attacker reliably overwrite the page-cache copy of a SUID binary.
-- **Trigger condition**: needs a kernel with `CONFIG_RDS`/`CONFIG_RDS_TCP` enabled, and the public PoC requires kernel 6.13+ for io_uring's `IORING_REGISTER_CLONE_BUFFERS`. **Arch Linux is effectively the only mainstream distro that ships the RDS module by default** — RHEL/Debian/Ubuntu don't reach this path out of the box (see the RHEL note below).
-- **RHEL impact**: **officially "Not affected" across RHEL 6–10** (Red Hat Security Data API — `package_state` is Not affected everywhere, no `affected_release` entries). Per CloudLinux's research, RHEL-family kernel configs carry `# CONFIG_RDS is not set` — the module doesn't exist at all, and `socket()` returns `EAFNOSUPPORT` immediately. RHEL 9/10 additionally default to `kernel.io_uring_disabled=2`, disabling io_uring itself.
-- **Mitigation**: on distros where RDS is actually compiled (e.g. Ubuntu), blocking `rds`/`rds_tcp`/`rds_rdma` is documented in the community as a working mitigation (section 5.6). Red Hat's own mitigation field says "no mitigation available / doesn't meet criteria," but this reads as boilerplate stemming from RHEL simply not being affected — don't confuse it with "no mitigation exists anywhere."
-- **Why it's rated low**: the overlapping prerequisites (RDS module + io_uring + a recent kernel) are uncommon enough that this is rated "Other." Re-evaluate upward for HPC/cluster environments that genuinely use RDS.
+- **Trigger condition**: needs a kernel with `CONFIG_RDS`/`CONFIG_RDS_TCP` enabled, and the public PoC requires kernel 6.13+ for io_uring's `IORING_REGISTER_CLONE_BUFFERS`.
+- **RDS was originally designed by Oracle as the interconnect protocol for RAC (Real Application Clusters) database nodes.** `rds_rdma` handles InfiniBand/RDMA-based cluster communication. Because of this, "the RDS module is compiled in" can itself be a signal that the box is a real production database cluster node — see the RHEL/Oracle Linux note below.
+- **RHEL (the actual product) impact**: **officially "Not affected" across RHEL 6–10** (Red Hat Security Data API — `package_state` is Not affected everywhere, no `affected_release` entries). Red Hat's own kernel source configs carry `# CONFIG_RDS is not set` — the module doesn't exist at all, and `socket()` returns `EAFNOSUPPORT` immediately.
+- **⚠️ Oracle Linux (UEK) is NOT covered by that "RHEL not affected" finding — verified directly, it ships `CONFIG_RDS=m`.** On 2026-07-23, checking the reference server (Oracle Linux 9.8, kernel `5.15.0-322.203.3.4.el9uek.x86_64`) with `grep CONFIG_RDS /boot/config-$(uname -r)` showed all three of `CONFIG_RDS=m`, `CONFIG_RDS_RDMA=m`, `CONFIG_RDS_TCP=m` compiled in. In hindsight this is unsurprising — Oracle built this protocol for its own RAC product, so of course Oracle Linux keeps it — but an earlier version of this guide generalized this as "RHEL family" without checking that specifically, which was wrong. **Never assume "RHEL family, so not affected" without verifying the specific distro.**
+- **Mitigation**: on distros where RDS is actually compiled (Ubuntu, Oracle Linux, etc.), blocking `rds`/`rds_tcp`/`rds_rdma` is documented in the community as a working mitigation (section 5.6). Red Hat's own mitigation field says "no mitigation available / doesn't meet criteria," but this reads as boilerplate stemming from RHEL (the actual product) simply not being affected — don't confuse it with "no mitigation exists anywhere."
+- **It's rated "Other" not because the risk is low, but because there's no reliable usage-signal detection method yet.** See section 5.6 for the full reasoning and why the script doesn't automate this one.
 
 ### 2.8 FUSE directory-cache overflow (CVE-2026-31694)
 
@@ -175,7 +177,7 @@ Section 2's "path / trigger condition" describes **which subsystem the vulnerabl
 - **Policy-level non-use** (the administrator never configured IPsec/VPN/AF_ALG) means nothing to the kernel. On an unpatched kernel, the vulnerable code is still present on the server.
 - **Only technical unreachability** (the code doesn't exist, or its call path is blocked) provides an actual defense.
 
-`algif_aead` (Copy Fail) is completely unrelated to IPsec/VPN configuration — `socket(AF_ALG, SOCK_SEQPACKET, 0)` can be called by any local account with no permission check whatsoever. The `esp4`/`esp6`/`rxrpc`/`act_pedit` (pedit COW) paths normally require `CAP_NET_ADMIN` for legitimate use, but inside an unprivileged user/net namespace (`unshare -Un`, etc.) — which most distros allow by default — an ordinary account can effectively reach that code with administrator-equivalent privilege. In short: **once a low-privileged account is already compromised, an attacker can invoke the feature directly and exploit the vulnerability regardless of the administrator's "we don't use it" policy.** All 5 P2 items (43284/43500/46300/43503/46331) fall under this exact logic, so **a single unprivileged user/net namespace restriction is a lever effective against all 5 at once** (see section 5.6 — though 46331 isn't automated by the script yet and needs manual application).
+`algif_aead` (Copy Fail) is completely unrelated to IPsec/VPN configuration — `socket(AF_ALG, SOCK_SEQPACKET, 0)` can be called by any local account with no permission check whatsoever. The `esp4`/`esp6`/`rxrpc`/`act_pedit` (pedit COW) paths normally require `CAP_NET_ADMIN` for legitimate use, but inside an unprivileged user/net namespace (`unshare -Un`, etc.) — which most distros allow by default — an ordinary account can effectively reach that code with administrator-equivalent privilege. In short: **once a low-privileged account is already compromised, an attacker can invoke the feature directly and exploit the vulnerability regardless of the administrator's "we don't use it" policy.** All 5 P2 items (43284/43500/46300/43503/46331) fall under this exact logic, so **a single unprivileged user/net namespace restriction is a lever effective against all 5 at once** — and the script automates all 5 (section 5.1).
 
 This is why blocking modules (`install ... /bin/false`) in [mitigate-cve-2026.sh](mitigate-cve-2026.sh) provides real defense — it's a technical measure that makes the kernel's module-autoload mechanism (`request_module()`) itself fail, **rendering the code path fundamentally unreachable regardless of the caller's privilege level.** By the same logic, this defense doesn't work when the target code is built in (`=y`) — there is no "load step" to block in the first place (section 5.5).
 
@@ -290,7 +292,7 @@ Comparing the `uname -r` version string against the upstream fix version is **no
 3. Only conclude "fully patched" once **all 5** of the original CVE IDs are confirmed. pedit COW/PinTheft/FUSE are a separate chain — verify each individually.
 4. Use automated tooling where available: Ubuntu's `ubuntu-security-status` / `pro fix CVE-XXXX --dry-run`, RHEL's `oscap`, etc.
 
-**[mitigate-cve-2026.sh](mitigate-cve-2026.sh) automates steps 2–3 above — but only for the original 5 CVEs.** It checks `rpm -q --changelog` on Red Hat family and dpkg changelogs on Debian/Ubuntu family (section 5.1). pedit COW/PinTheft/FUSE aren't checked by the script yet, so apply the procedure above manually (section 5.6).
+**[mitigate-cve-2026.sh](mitigate-cve-2026.sh) automates steps 2–3 above — but only for 6 CVEs (the original 5 plus pedit COW).** It checks `rpm -q --changelog` on Red Hat family and dpkg changelogs on Debian/Ubuntu family (section 5.1). PinTheft/FUSE aren't checked by the script yet, so apply the procedure above manually (section 5.6).
 
 #### When the changelog has no CVE ID
 
@@ -364,6 +366,8 @@ Separately from searching by CVE ID, if you want to know exactly which version r
 | 43494 (PinTheft) | **Not affected** | **Not affected** | **Not affected** | **Not affected** — `package_state` Not affected across all products, no `affected_release` entries. CONFIG_RDS itself is absent from RHEL kernels (section 2.7) |
 | 31694 (FUSE cache overflow) | **Not affected** | **Not affected** | **Not affected** | **Not affected** — `package_state` Not affected everywhere. Presumably because the large-FUSE-readdir-buffer change isn't present (section 2.8) |
 
+> ⚠️ **This table applies to RHEL (Red Hat Enterprise Linux) the actual product only — don't assume "not affected" carries over to RHEL-derived distros** like Oracle Linux, even though CentOS Stream is patched effectively identically to RHEL. In fact, PinTheft (43494) **is not "not affected" on Oracle Linux (UEK)** — checking the reference server (Oracle Linux 9.8, kernel `5.15.0-322.203.3.4.el9uek.x86_64`) directly on 2026-07-23 showed all three of `CONFIG_RDS=m`, `CONFIG_RDS_RDMA=m`, `CONFIG_RDS_TCP=m` compiled in (section 2.7). Always verify "not affected" against the specific distro you're actually running.
+
 > **Don't compare version numbers across rows.** The `kernel-6.12.0-211.16.1.el10_2` (10.2 stream) in the table above and `kernel-6.12.0-124.56.1.el10_1` (10.1 stream) below are on **different minor streams**, so comparing the numeric size directly is invalid (`124` < `211` does not mean el10_1 is the lower version). RHEL maintains an independent kernel line per minor release, so only compare versions **within the same stream** you're actually on (`el9_7`, `el10_1`, `el10_2`, etc.).
 >
 > Verify the RHSA numbers and package versions in this table directly on the corresponding erratum page before rolling out to production.
@@ -413,7 +417,7 @@ The only "not affected" exemption [mitigate-cve-2026.sh](mitigate-cve-2026.sh) h
 
 Production fleets often need time for change approval and a maintenance window before a reboot or kernel swap. [mitigate-cve-2026.sh](mitigate-cve-2026.sh) can bridge that gap as a temporary **compensating control**. **Recognize clearly that this does not replace the patch — it only reduces attack surface until the patch can be applied.**
 
-> **Scope note**: this section (5.1–5.5) covers only the **original 5 CVEs** (31431/43284/43500/46300/43503) that the script actually automates. The 3 additionally identified CVEs — pedit COW (46331), PinTheft (43494), and the FUSE cache overflow (31694) — are not yet handled by the script; manual mitigation steps for those are in section 5.6.
+> **Scope note**: this section (5.1–5.5) covers the **6 CVEs** (31431/43284/43500/46300/43503/46331) the script actually automates. The 2 additionally identified CVEs — PinTheft (43494) and the FUSE cache overflow (31694) — are not yet handled by the script; manual mitigation steps for those are in section 5.6.
 
 ### 5.1 What the script covers
 
@@ -421,12 +425,13 @@ Production fleets often need time for change approval and a maintenance window b
 |---|---|---|
 | Block autoload of `esp4`/`esp6` + unload | 43284, 46300, 43503 | `install .../bin/false` + `blacklist` + `modprobe -r` |
 | Block autoload of `rxrpc` + unload | 43500 | Same method |
-| Block autoload of `algif_aead` + unload | 31431 | Same method |
-| Built-in (`=y`) detection and warning | All 5 (used to judge trigger reachability) | Checks `/boot/config-$(uname -r)` |
-| **Automatic distro patch check + skip already-patched modules** | All 5 | Red Hat family: `rpm -q --changelog` / Debian·Ubuntu family: dpkg changelog. All offline (default). See sections 4.3/4.4 |
-| **Vendor security advisory lookup (`--online`)** | All 5 | Red Hat family: `dnf updateinfo` confirms as vulnerable any CVE whose "fix shipped but is not installed" — the only definitive method on a kernel whose changelog has no CVE ID (e.g. Oracle UEK). Debian family: falls back to `apt changelog`. See section 4.2 |
-| **VPN/IPsec, RxRPC/AFS, container usage-signal detection (informational)** | Decision support | Checks `ip xfrm state/policy`, IKE ports, strongswan/libreswan services, AFS mounts, docker/podman/containerd/kubelet, etc. (all heuristic — never decides whether to block on your behalf) |
-| Restrict unprivileged user/net namespaces (optional) | 43284 / 46300 / 43503 (ESP path). **No effect on 31431** | `kernel.unprivileged_userns_clone=0` / `user.max_user_namespaces=0`. Original values are recorded in the config file's comments before applying |
+| Block autoload of `algif_aead` + unload | 31431 | Same method. **This is the top-priority KEV-listed item, so if it's in scope, the script asks about it independently and first**, separate from the rest (section 5.3) |
+| Block autoload of `act_pedit` + unload | 46331 | Same method. Also checks tc-pedit usage signals (`tc actions show action pedit`) |
+| Built-in (`=y`) detection and warning | All 6 (used to judge trigger reachability) | Checks `/boot/config-$(uname -r)` |
+| **Automatic distro patch check + skip already-patched modules** | All 6 | Red Hat family: `rpm -q --changelog` / Debian·Ubuntu family: dpkg changelog. All offline (default). See sections 4.3/4.4 |
+| **Vendor security advisory lookup (`--online`)** | All 6 | Red Hat family: `dnf updateinfo` confirms as vulnerable any CVE whose "fix shipped but is not installed" — the only definitive method on a kernel whose changelog has no CVE ID (e.g. Oracle UEK). Debian family: falls back to `apt changelog`. See section 4.2 |
+| **VPN/IPsec, RxRPC/AFS, tc pedit, container usage-signal detection (informational)** | Decision support | Checks `ip xfrm state/policy`, IKE ports, strongswan/libreswan services, AFS mounts, `tc actions show action pedit`, docker/podman/containerd/kubelet, etc. (all heuristic — never decides whether to block on your behalf) |
+| Restrict unprivileged user/net namespaces (optional) | 43284 / 46300 / 43503 / 46331 (ESP / act_pedit paths). **No effect on 31431** | `kernel.unprivileged_userns_clone=0` / `user.max_user_namespaces=0`. Original values are recorded in the config file's comments before applying |
 | **Conclusion-first summary output** | — | By default, prints only the diagnosis (confirmed vulnerable / unknown / not affected) and priority-ordered actions. Rationale is behind `--verbose` |
 | **Rollback** | — | `--rollback` deletes the modprobe/sysctl configuration this script created and restores original sysctl values |
 
@@ -475,7 +480,7 @@ For asset scanning, run `--dry-run` and collect only hosts with exit code `10`. 
    ```bash
    sudo bash mitigate-cve-2026.sh | tee "/var/log/mitigate-cve-2026-$(date +%F-%H%M).log"
    ```
-4. Answering `y` at the prompt creates the block config (`/etc/modprobe.d/mitigate-cve-2026.conf`, containing only the modules still in scope), unloads currently loaded modules, and runs post-verification automatically. The config file's comments record the creation time, hostname, kernel version, and script version for change tracking.
+4. If `algif_aead` (Copy Fail) is in scope, the script asks about it **independently and first** (explaining both its urgency as the KEV-listed top-priority item and that its risk is low since it's rarely used in practice). It then asks about the remaining in-scope modules as a group. Approving only one still applies whatever was approved — hesitating over another module never sinks the Copy Fail action along with it. Whatever gets approved is used to create the block config (`/etc/modprobe.d/mitigate-cve-2026.conf`), unload currently loaded modules, and run post-verification automatically. The config file's comments record the creation time, hostname, kernel version, and script version for change tracking.
 5. If a built-in target was detected, the script separately asks at the end whether to also restrict namespaces — a fresh warning is shown here if container signals were detected. Because of its high impact, **this is never auto-applied even in `--yes` mode**; approve it interactively per host if needed.
 6. The script is idempotent, so state persists across reruns. Use `--yes` for bulk rollout.
    ```yaml
@@ -509,24 +514,18 @@ For asset scanning, run `--dry-run` and collect only hosts with exit code `10`. 
 - **`--yes` does not replace human impact assessment.** This flag exists to "reapply an already-reviewed decision consistently across a server group," not to greenlight blanket application to unreviewed infrastructure. Collect the target list with `--dry-run` first, confirm IPsec/AF_ALG usage, and only then use `--yes`.
 - **Blocking cannot immediately disable a module that's already loaded and in use.** If `modprobe -r` fails (refcount > 0), that module stays in memory until reboot. The script explicitly warns about this, but if immediate mitigation is required, stop the service using that feature first.
 
-### 5.6 The 3 CVEs the script doesn't cover — manual mitigation
+### 5.6 The 2 CVEs the script doesn't cover — manual mitigation
 
-pedit COW (46331), PinTheft (43494), and the FUSE cache overflow (31694) are not yet automated by [mitigate-cve-2026.sh](mitigate-cve-2026.sh). Below are vendor- and community-documented manual procedures. **Confirm actual usage before applying anything, following the same principle as section 5.2** — there is no automatic pre-check, usage-signal detection, or rollback safety net here, so proceed more cautiously than with sections 5.1–5.5.
+PinTheft (43494) and the FUSE cache overflow (31694) are not yet automated by [mitigate-cve-2026.sh](mitigate-cve-2026.sh). Below are vendor- and community-documented manual procedures. **Confirm actual usage before applying anything, following the same principle as section 5.2** — there is no automatic pre-check, usage-signal detection, or rollback safety net here, so proceed more cautiously than with sections 5.1–5.5.
 
-#### pedit COW (CVE-2026-46331)
+**The exclusion reason differs for each.**
 
-This shares the exact same prerequisite as the P2 group (43284/43500/46300/43503) — an unprivileged namespace to acquire CAP_NET_ADMIN — so **if you've already applied this script's namespace restriction, pedit COW is likely already blocked too.** To block only the module (Red Hat's official **RHSB-2026-008** procedure):
-
-```bash
-echo "blacklist act_pedit" > /etc/modprobe.d/blacklist-act-pedit.conf
-lsmod | grep -qw act_pedit && rmmod act_pedit
-```
-
-> ⚠️ Not suitable for systems that actually use tc pedit rules for traffic shaping or packet-header rewriting (RHSB-2026-008 states this explicitly). Confirm actual usage first with `tc filter show` / `tc actions show action pedit`, etc.
+- **PinTheft (43494)**: excluded because **automated blocking carries an asymmetric risk.** RDS was designed for Oracle RAC database cluster interconnects, so a server with `rds`/`rds_rdma`/`rds_tcp` compiled in could plausibly be a live database cluster node (section 2.7). Reliable usage-signal detection — checking active RDS sockets, Oracle Clusterware processes/package traces, etc. — comparable to what esp4/esp6 (`ip xfrm`), rxrpc (AFS mounts), and act_pedit (`tc actions show`) already have, hasn't been designed or validated yet. Automating a block without that would risk a worse silent failure (severing a live database cluster interconnect) than any of the 6 CVEs the script already automates.
+- **FUSE cache overflow (31694)**: excluded for the opposite reason — **its real-world usage footprint doesn't fit the script's "safe to block by default" assumption.** The `fuse` module is depended on by sshfs, rclone, many Snap packages, and desktop cloud-sync tools, unlike the narrowly-used esp4/esp6/rxrpc/act_pedit/algif_aead (section 2.8). It also only manifests on kernel 6.16-rc1+, which RHEL and other major stable distros don't yet ship, lowering the urgency to automate right now. The recommended mitigations (removing `fusermount3`'s setuid bit, mount policy restrictions) don't fit the script's "block one module" pattern either, so they're left as a manual procedure.
 
 #### PinTheft (CVE-2026-43494)
 
-**RHEL/CloudLinux family is already not affected** (CONFIG_RDS is absent entirely, section 2.7) — this procedure only applies to distros where RDS is actually compiled in (e.g. Ubuntu).
+**RHEL (the actual product) and CloudLinux are already not affected** (CONFIG_RDS is absent entirely, section 2.7) — **but Oracle Linux (UEK) is not** (verified `CONFIG_RDS=m`, section 2.7). This procedure applies to distros where RDS is actually compiled in (Ubuntu, Oracle Linux, etc.), and **you must confirm actual RDS usage first** (active sockets, Oracle Clusterware/database clustering software traces, etc.) — this is exactly why it isn't automated yet (see the reasoning at the top of section 5.6).
 
 ```bash
 printf 'install rds /bin/false\ninstall rds_tcp /bin/false\ninstall rds_rdma /bin/false\n' > /etc/modprobe.d/pintheft.conf
@@ -549,8 +548,8 @@ The `fuse` module is depended on by sshfs, rclone, and many Snap packages, so it
 ## 6. Checklist
 
 - [ ] **Did you prioritize CVE-2026-31431 (Copy Fail) above everything else?** — it's CISA KEV-listed, has confirmed active exploitation, has a public PoC, and AF_ALG is reachable by any local account without a namespace (section 1.1)
-- [ ] Did you re-query the [CISA KEV catalog](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) for all 5 CVEs at the time of application? (the table in section 1.1 is a point-in-time snapshot)
-- [ ] Did you individually confirm, via distro advisories (not version comparison), whether the target servers are actually patched for each of the 5 CVEs (31431/43284/43500/46300/43503)? (sections 4.2–4.4)
+- [ ] Did you re-query the [CISA KEV catalog](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) for all 8 CVEs at the time of application? (the table in section 1.1 is a point-in-time snapshot)
+- [ ] Did you individually confirm, via distro advisories (not version comparison), whether the target servers are actually patched for each of the 6 script-supported CVEs (31431/43284/43500/46300/43503/46331)? (sections 4.2–4.4)
 - [ ] Did you separately confirm Fragnesia (46300) is included? (43284 alone is insufficient)
 - [ ] On Red Hat/Debian family systems, did you review the script's step 0-2 automatic patch determination output? (including whether an unconfirmed changelog is safely treated as `[WARN]`/in scope)
 - [ ] Did you identify the list of servers that cannot receive the official patch immediately?
@@ -559,8 +558,7 @@ The `fuse` module is depended on by sshfs, rclone, and many Snap packages, so it
 - [ ] Did you run the mitigation script's pre-check (dry-run) first and review the full step 0 through 0-3 output?
 - [ ] Did you prepare the change-management approval and logging procedure?
 - [ ] Did you set a separate target date for applying the official patch?
-- [ ] **Did you also check patch status for the 3 additional CVEs (pedit COW/PinTheft/FUSE)?** — the script doesn't check these automatically; verify manually against distro advisories (section 1, sections 2.6–2.8)
-- [ ] Did you confirm whether pedit COW (46331) is already covered by the same namespace restriction applied to the P2 group, or whether `act_pedit` is actually in use and needs separate handling? (section 5.6)
+- [ ] **Did you also check patch status for the 2 additional CVEs (PinTheft/FUSE)?** — the script doesn't check these automatically; verify manually against distro advisories (section 1, sections 2.7–2.8)
 - [ ] Did you confirm whether "Other"-tier prerequisites (RDS for PinTheft, kernel 6.16+ for FUSE) actually exist in your fleet, and re-rate priority upward if so? (section 1.1)
 
 ---
@@ -588,7 +586,7 @@ The `fuse` module is depended on by sshfs, rclone, and many Snap packages, so it
 - [Dirty Frag: LPE via ESP and RxRPC - Wiz](https://www.wiz.io/blog/dirty-frag-linux-kernel-local-privilege-escalation-via-esp-and-rxrpc)
 - [Copy Fail (CVE-2026-31431): FAQ - Tenable](https://www.tenable.com/blog/copy-fail-cve-2026-31431-frequently-asked-questions-about-linux-kernel-privilege-escalation)
 
-**The 3 additionally identified CVEs (sections 2.6–2.8, section 5.6)**
+**The 3 additionally identified CVEs (sections 2.6–2.8)**
 
 - [RHSB-2026-008 - Traffic Control Privilege Escalation - Red Hat](https://access.redhat.com/security/vulnerabilities/RHSB-2026-008)
 - [pedit COW (CVE-2026-46331): Mitigation and Kernel Update - CloudLinux](https://blog.cloudlinux.com/pedit-cow-mitigation-and-kernel-update)
@@ -611,7 +609,7 @@ The `fuse` module is depended on by sshfs, rclone, and many Snap packages, so it
 
 **Threat-status sources (basis for section 1.1)**
 
-- [CISA KEV catalog](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) — re-query all 5 CVEs at the time of application
+- [CISA KEV catalog](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) — re-query all 8 CVEs at the time of application
 - [CISA Adds Actively Exploited Linux Root Access Bug CVE-2026-31431 to KEV - The Hacker News](https://thehackernews.com/2026/05/cisa-adds-actively-exploited-linux-root.html)
 - [CVE-2026-31431 Copy Fail — Microsoft Security Blog](https://www.microsoft.com/en-us/security/blog/2026/05/01/cve-2026-31431-copy-fail-vulnerability-enables-linux-root-privilege-escalation/)
 - [PoC exploit available for Linux 'Copy Fail' - Sophos](https://www.sophos.com/en-us/blog/proof-of-concept-exploit-available-for-linux-copy-fail-cve-2026-31431)

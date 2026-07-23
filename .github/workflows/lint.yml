@@ -151,18 +151,21 @@ jobs:
 
           # RHEL 계열이므로 43500(rxrpc)은 1차 출처 근거로 항상 제외된다.
           expect "changelog 없음" \
-                 "esp4 esp6 algif_aead" "$(plan_of '')"
+                 "esp4 esp6 algif_aead act_pedit" "$(plan_of '')"
 
-          expect "5개 전부 패치 기재 → 대상 없음" \
-                 "" "$(plan_of 'CVE-2026-31431 CVE-2026-43284 CVE-2026-43500 CVE-2026-46300 CVE-2026-43503')"
+          expect "6개 전부 패치 기재 → 대상 없음" \
+                 "" "$(plan_of 'CVE-2026-31431 CVE-2026-43284 CVE-2026-43500 CVE-2026-46300 CVE-2026-43503 CVE-2026-46331')"
 
           expect "31431만 패치 → algif_aead 제외" \
-                 "esp4 esp6" "$(plan_of 'fix CVE-2026-31431')"
+                 "esp4 esp6 act_pedit" "$(plan_of 'fix CVE-2026-31431')"
 
           # 43503 이 changelog 에 없으면 esp 는 조치 대상으로 남아야 한다.
           # 벤더 예외로 이를 건너뛰는 경로를 다시 만들지 않도록 고정한다.
           expect "43503 미확인 → esp 포함(fail-safe)" \
-                 "esp4 esp6 algif_aead" "$(plan_of 'CVE-2026-43284 CVE-2026-46300')"
+                 "esp4 esp6 algif_aead act_pedit" "$(plan_of 'CVE-2026-43284 CVE-2026-46300')"
+
+          expect "46331만 패치 → act_pedit 제외" \
+                 "esp4 esp6 algif_aead" "$(plan_of 'fix CVE-2026-46331')"
 
           expect "미지원 플래그는 인자 오류(exit 2)" \
                  "2" "$(bash mitigate-cve-2026.sh --trust-vendor-exceptions >/dev/null 2>&1; echo $?)"
