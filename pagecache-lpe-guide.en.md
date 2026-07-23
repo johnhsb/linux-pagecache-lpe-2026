@@ -13,13 +13,18 @@
 ## TL;DR
 
 - **Same flaw, different paths — now 8 of them.** All share the same failure class: "treating file-backed page-cache memory as a normal write target and writing to it in place." But the specific technical defect splits into at least 4 families: ① loss of the `SKBFL_SHARED_FRAG` flag (43284/43500/46300/43503), ② the reverted 2017 AEAD in-place optimization (31431), ③ a COW-range miscalculation in `skb_ensure_writable()` (46331), and ④ unrelated one-off bugs — an RDS double-free (43494) and an unchecked FUSE boundary (31694). Trigger paths differ, so **each of the 8 CVEs exists as a separate patch commit** (section 1, section 3.1).
+
 - **Real-world risk splits into 3 tiers — respond in this order, not by CVE count.**
   - 🔴 **P1**: Copy Fail (31431) — the only one listed in CISA KEV with confirmed active exploitation; its trigger needs no namespace at all.
   - 🟠 **P2**: Dirty Frag (43284/43500), Fragnesia (46300), DirtyClone (43503), pedit COW (46331) — all share the exact same prerequisite (an unprivileged user/net namespace to acquire CAP_NET_ADMIN), all have public PoCs, and all have a vendor RHSB (RHSB-2026-003 for 43284/43500/46300, RHSB-2026-008 for 46331).
   - ⚪ **Other (low likelihood right now)**: PinTheft (43494) — the RDS module isn't compiled into most distro kernels by default. FUSE cache overflow (31694) — requires kernel 6.16-rc1+, so RHEL and other major distros are entirely unaffected as of now. (section 1.1)
+
 - **"We patched" only guarantees safety if all the relevant commits are present.** Fragnesia (46300) in particular is a separate, pre-existing flaw that only becomes exploitable once the 43284 patch is applied — **a kernel with 43284 but not 46300 can be more exposed than one with neither.** DirtyClone (43503) requires the entire "DirtyFrag + Fragnesia chain" for full protection (section 2.4, section 4.1).
+
 - **Comparing `uname -r` version numbers alone cannot tell you if you're patched.** Distros frequently keep the upstream version string while backporting only the security fix. Check the CVE ID directly against your distro's advisories (section 4.2).
+
 - **More RHEL exemptions now, but don't generalize them to "RHEL family."** Beyond 43500 (RxRPC), **both 43494 (PinTheft) and 31694 (FUSE) are officially not affected on RHEL itself (RHEL 6–10).** But that doesn't extend to every RHEL-derived distro — **Oracle Linux (UEK) is directly verified to ship `CONFIG_RDS=m`**, so PinTheft *does* apply there (section 2.7). Conversely, 46331 (pedit COW) does affect RHEL 8/9/10. The rest are mostly affected, and the `el9_7`/`el10_1` minor streams in particular never received fixes for 46300/43503 — **updating packages within the same stream is not enough; you must switch minor streams** (section 4.4).
+
 - **A real patch is the only complete fix; the mitigation script is a stopgap until then.** The module-blocking approach in [mitigate-cve-2026.sh](mitigate-cve-2026.sh) is the exact procedure Red Hat documents in RHSB-2026-003 / RHSB-2026-008. That said, DirtyClone's root cause lives in the kernel core, so blocking modules only closes the confirmed trigger (esp4/esp6) — and **PinTheft and FUSE are not yet automated by the script** (section 5, section 5.6).
 
 ---

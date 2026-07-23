@@ -9,12 +9,16 @@
 ## TL;DR
 
 - **8 CVEs in scope, but the script only automates 6.** All share the same failure class — "treating file-backed page-cache memory as a normal write target and writing to it in place." Trigger paths differ, so **each CVE needs its own patch**. [mitigate-cve-2026.sh](mitigate-cve-2026.sh) automates 31431/43284/43500/46300/43503/46331; 43494 (PinTheft) and 31694 (FUSE) only have manual steps documented in the guide.
+
 - **Real-world risk splits into 3 tiers.**
   - 🔴 **P1**: Copy Fail (31431) — the family is commonly called "Dirty Frag," but Copy Fail is the **only one of the eight listed in the CISA KEV catalog** (2026-05-01) with **confirmed active exploitation**, and its trigger bar is the lowest — an `AF_ALG` socket can be opened by any local account without an unprivileged namespace. If you can only apply a partial mitigation, **block `algif_aead` first**.
   - 🟠 **P2**: Dirty Frag (43284/43500), Fragnesia (46300), DirtyClone (43503), pedit COW (46331) — all share the same prerequisite (an unprivileged user/net namespace to acquire CAP_NET_ADMIN), and all have public PoCs and a vendor RHSB.
   - ⚪ **Other**: PinTheft (43494), FUSE cache overflow (31694) — "Other" doesn't mean "low risk"; the reason differs per CVE, see the Target CVEs table and guide section 5.6.
+
 - **Why a mitigation script at all**: the real fix is a kernel patch, but production fleets often can't patch immediately — no reboot window, a vendor-pinned kernel, no patch published yet, or a change-management process that takes weeks. This script is a **compensating control** for that gap.
+
 - **How it works**: blocks autoload of the kernel modules that reach the vulnerable code (`esp4`/`esp6`/`rxrpc`/`algif_aead`). This is **the exact mitigation procedure Red Hat documents in RHSB-2026-003**, so it can be cited when requesting change-management approval. No reboot required; `--rollback` reverts instantly.
+
 - **Only a patch is a complete fix**: DirtyClone's (43503) root cause lives in a core kernel function (`__pskb_copy_fclone()`), so blocking modules only closes the known trigger, not the flaw itself. Full protection requires a kernel with the entire DirtyFrag+Fragnesia chain (upstream v7.1-rc5 or later).
 
 ```bash
