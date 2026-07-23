@@ -1,0 +1,8 @@
+.claude/
+
+# macOS
+.DS_Store
+._*
+
+# 실행 로그 (가이드 5.3절의 tee 출력)
+mitigate-cve-2026-*.log

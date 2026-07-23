@@ -1,0 +1,171 @@
+name: lint & test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax check
+        run: bash -n mitigate-cve-2026.sh
+      - name: shellcheck
+        uses: docker://koalaman/shellcheck:stable
+        with:
+          args: --severity=warning mitigate-cve-2026.sh
+
+  # 스크립트가 지원한다고 문서화한 배포판에서 실제로 동작하는지 확인한다.
+  # AlmaLinux 8은 bash 4.4로, 문서에 명시한 "Bash 4+" 하한선을 검증하는 역할.
+  distros:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - ubuntu:24.04
+          - debian:12
+          - rockylinux/rockylinux:9
+          - almalinux:8
+    container:
+      image: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Environment
+        run: |
+          . /etc/os-release; echo "$PRETTY_NAME / bash $BASH_VERSION"
+
+      - name: Run test suite
+        shell: bash
+        run: |
+          # GitHub Actions 는 스텝을 'bash -e' 로 실행한다. 이 테스트는 0이 아닌
+          # 종료 코드를 '기대값'으로 검증하므로 errexit 를 반드시 꺼야 한다
+          # (끄지 않으면 첫 비정상 종료 검사에서 스텝 자체가 죽는다).
+          set +e
+          set -u
+          S=mitigate-cve-2026.sh
+          fail=0
+          chk() { # chk <설명> <기대> <실제>
+            if [ "$2" = "$3" ]; then echo "  ok   $1"
+            else echo "  FAIL $1 — 기대 $2, 실제 $3"; fail=$((fail+1)); fi
+          }
+
+          echo "-- 인자 처리 --"
+          bash $S --help    >/dev/null 2>&1; chk "--help"        0 $?
+          bash $S --version >/dev/null 2>&1; chk "--version"     0 $?
+          bash $S --zzz     >/dev/null 2>&1; chk "잘못된 인자"   2 $?
+          bash $S --dry-run --yes >/dev/null 2>&1; chk "배타 옵션" 2 $?
+
+          echo "-- 기본은 오프라인이어야 한다 --"
+          mkdir -p /tmp/nettrap
+          for c in dnf apt curl wget; do
+            printf '#!/bin/sh\necho NETCALL:%s >&2\nexit 1\n' "$c" > /tmp/nettrap/$c
+            chmod +x /tmp/nettrap/$c
+          done
+          PATH=/tmp/nettrap:$PATH bash $S --dry-run 2>/tmp/net.txt >/dev/null || true
+          if grep -q NETCALL /tmp/net.txt; then
+            echo "  FAIL 기본 실행이 네트워크 명령을 호출함"; fail=$((fail+1))
+          else
+            echo "  ok   기본 실행에서 네트워크 호출 없음"
+          fi
+          bash $S --dry-run --online >/dev/null 2>&1; rc=$?
+          case "$rc" in 0|10) echo "  ok   --online exit=$rc" ;;
+                        *) echo "  FAIL --online exit=$rc"; fail=$((fail+1)) ;; esac
+
+          echo "-- 기본 출력은 요약, 상세는 --verbose --"
+          b=$(bash $S --dry-run 2>&1 | wc -l)
+          v=$(bash $S --dry-run --verbose 2>&1 | wc -l)
+          if [ "$b" -lt "$v" ]; then echo "  ok   기본 ${b}줄 < verbose ${v}줄"
+          else echo "  FAIL 기본 ${b}줄 >= verbose ${v}줄"; fail=$((fail+1)); fi
+
+          echo "-- root 강제 --"
+          useradd -m tester 2>/dev/null || true
+          su tester -c "bash $PWD/$S --dry-run" >/tmp/nr.txt 2>&1; chk "비root 거부" 1 $?
+          grep -q "root 권한으로 실행" /tmp/nr.txt \
+            && echo "  ok   비root 안내 문구" \
+            || { echo "  FAIL 비root 안내 문구 없음"; fail=$((fail+1)); }
+
+          echo "-- dry-run 은 아무것도 바꾸지 않아야 한다 --"
+          bash $S --dry-run >/dev/null 2>&1; rc=$?
+          case "$rc" in 0|10) echo "  ok   dry-run exit=$rc" ;;
+                        *) echo "  FAIL dry-run exit=$rc"; fail=$((fail+1)) ;; esac
+          for f in /etc/modprobe.d/mitigate-cve-2026.conf \
+                   /etc/sysctl.d/99-mitigate-cve-2026-userns.conf; do
+            [ -e "$f" ] && { echo "  FAIL dry-run이 $f 생성"; fail=$((fail+1)); }
+          done
+          [ -e /etc/modprobe.d/mitigate-cve-2026.conf ] || echo "  ok   dry-run 무변경"
+
+          echo "-- 적용 / 멱등 / 원복 수명주기 --"
+          bash $S --rollback --yes >/dev/null 2>&1; chk "빈 상태 원복"      0 $?
+          bash $S --yes            >/dev/null 2>&1; chk "적용"              20 $?
+          bash $S --yes            >/dev/null 2>&1; chk "재실행(멱등)"      0 $?
+          bash $S --dry-run        >/dev/null 2>&1; chk "적용 후 dry-run"   0 $?
+          bash $S --rollback --yes >/dev/null 2>&1; chk "원복"              0 $?
+          [ -e /etc/modprobe.d/mitigate-cve-2026.conf ] \
+            && { echo "  FAIL 원복 후 파일 잔존"; fail=$((fail+1)); } \
+            || echo "  ok   원복 후 파일 삭제됨"
+          bash $S --dry-run >/dev/null 2>&1; chk "원복 후 dry-run"          10 $?
+
+          echo
+          [ "$fail" -eq 0 ] && echo "모든 검사 통과" || { echo "$fail 건 실패"; exit 1; }
+
+  # CVE 판정 로직은 커널 패키지 changelog에 의존하므로, 가짜 rpm 을 주입해
+  # 결정 경로를 직접 검증한다. 이 로직이 틀리면 취약한 서버가 조치에서
+  # 빠지므로(fail-open) 회귀 검증 가치가 가장 높다.
+  cve-decision:
+    runs-on: ubuntu-latest
+    container:
+      image: almalinux:8
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Inject fake rpm and assert decisions
+        shell: bash
+        run: |
+          set +e   # 위와 동일한 이유(비정상 종료 코드를 기대값으로 검증)
+          set -u
+          mkdir -p /fake
+          cat > /fake/rpm <<'RPM'
+          #!/bin/bash
+          if [ "$1" = "-q" ] && [ "$2" = "--changelog" ]; then printf '%s\n' "$FAKE_CHANGELOG"; exit 0; fi
+          if [ "$1" = "-q" ]; then exit 0; fi
+          exit 1
+          RPM
+          chmod +x /fake/rpm
+          export PATH=/fake:$PATH
+          fail=0
+
+          plan_of() { # plan_of <changelog> [옵션] -> 차단 대상 문자열
+            # '차단 대상 모듈:' 줄은 --verbose 에서만 나온다(기본 출력은 요약).
+            FAKE_CHANGELOG="$1" bash mitigate-cve-2026.sh --dry-run --verbose ${2:-} 2>&1 \
+              | sed -n 's/^차단 대상 모듈: //p'
+          }
+          expect() { # expect <설명> <기대> <실제>
+            if [ "$2" = "$3" ]; then echo "  ok   $1"
+            else echo "  FAIL $1 — 기대 [$2] 실제 [$3]"; fail=$((fail+1)); fi
+          }
+
+          # RHEL 계열이므로 43500(rxrpc)은 1차 출처 근거로 항상 제외된다.
+          expect "changelog 없음" \
+                 "esp4 esp6 algif_aead" "$(plan_of '')"
+
+          expect "5개 전부 패치 기재 → 대상 없음" \
+                 "" "$(plan_of 'CVE-2026-31431 CVE-2026-43284 CVE-2026-43500 CVE-2026-46300 CVE-2026-43503')"
+
+          expect "31431만 패치 → algif_aead 제외" \
+                 "esp4 esp6" "$(plan_of 'fix CVE-2026-31431')"
+
+          # 43503 이 changelog 에 없으면 esp 는 조치 대상으로 남아야 한다.
+          # 벤더 예외로 이를 건너뛰는 경로를 다시 만들지 않도록 고정한다.
+          expect "43503 미확인 → esp 포함(fail-safe)" \
+                 "esp4 esp6 algif_aead" "$(plan_of 'CVE-2026-43284 CVE-2026-46300')"
+
+          expect "미지원 플래그는 인자 오류(exit 2)" \
+                 "2" "$(bash mitigate-cve-2026.sh --trust-vendor-exceptions >/dev/null 2>&1; echo $?)"
+
+          echo
+          [ "$fail" -eq 0 ] && echo "CVE 판정 로직 통과" || { echo "$fail 건 실패"; exit 1; }
