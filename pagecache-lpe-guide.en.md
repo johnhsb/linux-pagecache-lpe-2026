@@ -1,8 +1,8 @@
-# Linux Kernel Page-Cache LPE Vulnerability Guide (Copy Fail · Dirty Frag family)
+# Linux Kernel Page-Cache LPE Vulnerability Guide (Copy Fail · Dirty Frag family and beyond)
 
-**Target CVEs**: CVE-2026-31431 (Copy Fail), CVE-2026-43284/CVE-2026-43500 (Dirty Frag), CVE-2026-46300 (Fragnesia), CVE-2026-43503 (DirtyClone)
+**Target CVEs**: CVE-2026-31431 (Copy Fail), CVE-2026-43284/CVE-2026-43500 (Dirty Frag), CVE-2026-46300 (Fragnesia), CVE-2026-43503 (DirtyClone), CVE-2026-46331 (pedit COW), CVE-2026-43494 (PinTheft), CVE-2026-31694 (FUSE directory-cache overflow) — 8 CVEs total
 
-**Purpose**: explain the technical root cause and shared traits of each vulnerability, document how to apply the official patches and what to watch for, and provide a safe procedure for using the [mitigate-cve-2026.sh](mitigate-cve-2026.sh) mitigation script on production systems that cannot patch immediately.
+**Purpose**: explain the technical root cause and shared traits of these 8 vulnerabilities that misuse the page cache as an in-place write target, document how to apply the official patches and what to watch for, and provide a safe procedure for using the [mitigate-cve-2026.sh](mitigate-cve-2026.sh) mitigation script on production systems that cannot patch immediately. **The script only automates 5 of the 8** (31431/43284/43500/46300/43503) — the other 3 have manual-only mitigation steps in section 5.6.
 
 **Audience**: system/security operators, and whoever will apply this script to production servers.
 
@@ -12,48 +12,64 @@
 
 ## TL;DR
 
-- **Same flaw, different paths**: all 5 CVEs share the same failure class — "treating file-backed page-cache memory as an ordinary packet buffer and writing to it in place." Four of them (43284/43500/46300/43503) stem from the `SKBFL_SHARED_FRAG` flag being lost somewhere in the fragmentation, coalescing, cloning, or reassembly path; Copy Fail (31431) alone comes from a different code path (the 2017 AEAD in-place optimization). Trigger paths differ, so **each of the 5 CVEs exists as a separate patch commit** (section 1, section 3.1).
-- **The family is called "Dirty Frag," but the top priority is Copy Fail (31431).** It's the **only one of the five listed in CISA KEV** (2026-05-01, FCEB remediation deadline 2026-05-15) with **confirmed active exploitation**, and its trigger bar is the lowest — any local account can open an `AF_ALG` socket without even an unprivileged namespace (section 1.1, section 3.2).
-- **"We patched" only guarantees safety if all 5 commits are present.** Fragnesia (46300) in particular is a separate, pre-existing flaw that only becomes exploitable once the 43284 patch is applied — **a kernel with 43284 but not 46300 can be more exposed than one with neither.** DirtyClone (43503) requires the entire "DirtyFrag + Fragnesia chain" for full protection (section 2.4, section 4.1).
+- **Same flaw, different paths — now 8 of them.** All share the same failure class: "treating file-backed page-cache memory as a normal write target and writing to it in place." But the specific technical defect splits into at least 4 families: ① loss of the `SKBFL_SHARED_FRAG` flag (43284/43500/46300/43503), ② the reverted 2017 AEAD in-place optimization (31431), ③ a COW-range miscalculation in `skb_ensure_writable()` (46331), and ④ unrelated one-off bugs — an RDS double-free (43494) and an unchecked FUSE boundary (31694). Trigger paths differ, so **each of the 8 CVEs exists as a separate patch commit** (section 1, section 3.1).
+- **Real-world risk splits into 3 tiers — respond in this order, not by CVE count.**
+  - 🔴 **P1**: Copy Fail (31431) — the only one listed in CISA KEV with confirmed active exploitation; its trigger needs no namespace at all.
+  - 🟠 **P2**: Dirty Frag (43284/43500), Fragnesia (46300), DirtyClone (43503), pedit COW (46331) — all share the exact same prerequisite (an unprivileged user/net namespace to acquire CAP_NET_ADMIN), all have public PoCs, and all have a vendor RHSB (RHSB-2026-003 for 43284/43500/46300, RHSB-2026-008 for 46331).
+  - ⚪ **Other (low likelihood right now)**: PinTheft (43494) — the RDS module isn't compiled into most distro kernels by default. FUSE cache overflow (31694) — requires kernel 6.16-rc1+, so RHEL and other major distros are entirely unaffected as of now. (section 1.1)
+- **"We patched" only guarantees safety if all the relevant commits are present.** Fragnesia (46300) in particular is a separate, pre-existing flaw that only becomes exploitable once the 43284 patch is applied — **a kernel with 43284 but not 46300 can be more exposed than one with neither.** DirtyClone (43503) requires the entire "DirtyFrag + Fragnesia chain" for full protection (section 2.4, section 4.1).
 - **Comparing `uname -r` version numbers alone cannot tell you if you're patched.** Distros frequently keep the upstream version string while backporting only the security fix. Check the CVE ID directly against your distro's advisories (section 4.2).
-- **On RHEL/CentOS, only 43500 (RxRPC) is not affected across the board.** The other 4 mostly are, and the `el9_7`/`el10_1` minor streams in particular never received fixes for 46300/43503 — **updating packages within the same stream is not enough; you must switch minor streams** (section 4.4).
-- **A real patch is the only complete fix; the mitigation script is a stopgap until then.** The module-blocking approach in [mitigate-cve-2026.sh](mitigate-cve-2026.sh) is the exact procedure Red Hat documents in RHSB-2026-003. That said, DirtyClone's root cause lives in the kernel core, so blocking modules only closes the confirmed trigger (esp4/esp6) — it is not a complete fix (section 5).
+- **More RHEL/CentOS exemptions now.** Beyond 43500 (RxRPC), **both 43494 (PinTheft) and 31694 (FUSE) are officially not affected across RHEL 6–10.** Conversely, 46331 (pedit COW) does affect RHEL 8/9/10. The rest are mostly affected, and the `el9_7`/`el10_1` minor streams in particular never received fixes for 46300/43503 — **updating packages within the same stream is not enough; you must switch minor streams** (section 4.4).
+- **A real patch is the only complete fix; the mitigation script is a stopgap until then.** The module-blocking approach in [mitigate-cve-2026.sh](mitigate-cve-2026.sh) is the exact procedure Red Hat documents in RHSB-2026-003 / RHSB-2026-008. That said, DirtyClone's root cause lives in the kernel core, so blocking modules only closes the confirmed trigger (esp4/esp6) — and **the script itself does not yet automate pedit COW, PinTheft, or FUSE** (section 5, section 5.6).
 
 ---
 
 ## Needs re-verification before you apply
 
-- **CISA KEV listing, active-exploitation status, and CVSS scores are point-in-time snapshots.** The table in section 1.1 reflects the time of research; re-check all 5 CVEs against the [CISA KEV catalog](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) at the time you actually apply this.
+- **CISA KEV listing, active-exploitation status, and CVSS scores are point-in-time snapshots.** The table in section 1.1 reflects the time of research; re-check all 8 CVEs against the [CISA KEV catalog](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) at the time you actually apply this.
 - **Vendor advisories, RHSA numbers, and package versions are all snapshots re-verified on 2026-07-22.** In particular, verify the RHSA numbers and build versions in section 4.4 directly against the erratum page before rolling out in production.
 - **Oracle Linux 9 (UEK) has no published advisory for CVE-2026-43503 as of 2026-07.** Even the latest UEK kernel may still be unpatched for this CVE.
-- **CentOS Linux 7/8 (the traditional CentOS, now EOL) will not receive official patches for any of the 5 CVEs.** Migrating to AlmaLinux/Rocky, or paying for ELS, is effectively the only remaining path (section 4.4).
-- **Secondary sources — and even primary sources — disagree with each other in places.** This document always favored primary sources (OSV, Red Hat Security Data API) — e.g. RxRPC's vulnerable-since version (OSV/NVD's `5.3` vs. some blogs' "since ~2023"), Fragnesia's nature (a pre-existing flaw since 3.9, not a regression caused by the 43284 patch), and the CVSS vectors for CVE-2026-43284/43503 (OSV vs. Red Hat's own vector disagree — see the footnote in section 4.3 and the appendix). If this matters to a decision, re-query the primary source directly.
+- **CentOS Linux 7/8 (the traditional CentOS, now EOL) will not receive official patches for any of the original 5 CVEs.** Migrating to AlmaLinux/Rocky, or paying for ELS, is effectively the only remaining path (section 4.4).
+- **The "Other" classification for PinTheft (43494) and FUSE (31694) reflects current default distro configurations.** A system that enables RDS (e.g. some cluster/HPC environments) or already tracks kernel 6.16+ should re-rate these higher for its own fleet (section 2.6, section 2.8).
+- **pedit COW's (46331) CVSS differs by scoring authority in how they judge the privilege requirement (`PR`)** — kernel.org rates it `PR:L` (7.8), Red Hat rates it lower at `PR:H` (6.7). For an operational decision, go by "can CAP_NET_ADMIN be acquired via an unprivileged namespace" rather than the score alone (section 2.7).
+- **Secondary sources — and even primary sources — disagree with each other in places.** This document always favored primary sources (OSV, Red Hat Security Data API) — e.g. RxRPC's vulnerable-since version (OSV/NVD's `5.3` vs. some blogs' "since ~2023"), Fragnesia's nature (a pre-existing flaw since 3.9, not a regression caused by the 43284 patch), and the CVSS vectors for CVE-2026-43284/43503/43494 (OSV/kernel.org vs. Red Hat's own vector disagree — see the footnote in section 4.3 and the appendix). If this matters to a decision, re-query the primary source directly.
 - **A kernel whose changelog has no CVE ID** cannot be distinguished, from local information alone, between "not yet patched" and "this distro just doesn't record CVE IDs" (section 4.2). Use `--online` or a manual advisory lookup to resolve this.
+- **The FUSE bug's (31694) "research disclosure date" is reported inconsistently across sources** — NVD lists it 2026-05-01, but press coverage spread around 2026-07-10. This document uses the NVD date (section 2.8).
 
 ---
 
 ## 1. Target vulnerabilities at a glance
 
-| CVE | Alias | Subsystem | Related module | CVSS | Research disclosure | NVD published | Fix commit/version |
-|---|---|---|---|---|---|---|---|
-| CVE-2026-31431 | Copy Fail | Kernel crypto API (AF_ALG) | `algif_aead` | 7.8 | 2026-04-29 | 2026-04-22 | `a664bf3d603d` and others (reverts the 2017 optimization `72548b093ee3`) |
-| CVE-2026-43284 | Dirty Frag (ESP) | IPsec ESP input processing | `esp4`, `esp6` | 8.8 (Red Hat rating 7.8) | 2026-05-07 | 2026-05-08 | `f4c50a4034e6` (introduces `SKBFL_SHARED_FRAG`) |
-| CVE-2026-43500 | Dirty Frag (RxRPC) | RxRPC protocol processing | `rxrpc` | 7.8 | 2026-05-07 | 2026-05-11 | Separate commit from ESP (different subsystem, independent patch required) |
-| CVE-2026-46300 | Fragnesia | ESP path (`skb_try_coalesce()`) | `esp4`, `esp6` | 7.8 | 2026-05-13 | 2026-05-23 | Independent patch fixing a path distinct from 43284 |
-| CVE-2026-43503 | DirtyClone | skb clone path (kernel core) | Triggered via `esp4`, `esp6` | 8.8 (Red Hat rating 7.0) | 2026-06-25 | 2026-05-23 | Mainline merge 2026-05-21, included in upstream v7.1-rc5 (2026-05-24) |
+| CVE | Alias | Subsystem | Related module | CVSS | Research disclosure | NVD published | Script support | Fix commit/version |
+|---|---|---|---|---|---|---|---|---|
+| CVE-2026-31431 | Copy Fail | Kernel crypto API (AF_ALG) | `algif_aead` | 7.8 | 2026-04-29 | 2026-04-22 | ✅ | `a664bf3d603d` and others (reverts the 2017 optimization `72548b093ee3`) |
+| CVE-2026-43284 | Dirty Frag (ESP) | IPsec ESP input processing | `esp4`, `esp6` | 8.8 (Red Hat rating 7.8) | 2026-05-07 | 2026-05-08 | ✅ | `f4c50a4034e6` (introduces `SKBFL_SHARED_FRAG`) |
+| CVE-2026-43500 | Dirty Frag (RxRPC) | RxRPC protocol processing | `rxrpc` | 7.8 | 2026-05-07 | 2026-05-11 | ✅ | Separate commit from ESP (different subsystem, independent patch required) |
+| CVE-2026-46300 | Fragnesia | ESP path (`skb_try_coalesce()`) | `esp4`, `esp6` | 7.8 | 2026-05-13 | 2026-05-23 | ✅ | Independent patch fixing a path distinct from 43284 |
+| CVE-2026-43503 | DirtyClone | skb clone path (kernel core) | Triggered via `esp4`, `esp6` | 8.8 (Red Hat rating 7.0) | 2026-06-25 | 2026-05-23 | ✅ | Mainline merge 2026-05-21, included in upstream v7.1-rc5 (2026-05-24) |
+| CVE-2026-46331 | pedit COW | tc (traffic control) `act_pedit` | `act_pedit` | 7.8 (kernel.org) / 6.7 (Red Hat) | 2026-06-16 | 2026-06-16 | ❌ (manual, section 5.6) | v7.1-rc7 (introduced by 899ee91156e5, fixed by 2bec122b9fb9 and others) |
+| CVE-2026-43494 | PinTheft | RDS zerocopy + io_uring | `rds`, `rds_tcp`, `rds_rdma` | 7.8 (kernel.org) / 7.0 (Red Hat) | 2026-05-21 | 2026-05-21 | ❌ (manual, section 5.6) | 8 stable-branch patches (c6e51512a784 and others) |
+| CVE-2026-31694 | (FUSE cache overflow) | FUSE directory-entry caching | `fuse` | 7.8 (kernel.org) | 2026-05-01 (NVD) / 2026-07-10 (press coverage spread) | 2026-05-01 | ❌ (manual, section 5.6) | 474ce83c96a5 and others (only reachable from 6.16-rc1 onward) |
 
 ### 1.1 Threat status
 
-**This family is not a theoretical risk.** Look at the table below before setting response priorities.
+**This family is not a theoretical risk.** Look at the table below before setting response priorities — don't treat all 8 CVEs as equal; group them by **how many prerequisite steps the trigger requires**.
 
-| CVE | Public PoC | CISA KEV | Active exploitation | Mitigation priority |
-|---|---|---|---|---|
-| **CVE-2026-31431 (Copy Fail)** | **Yes** (732-byte Python) | **Listed — 2026-05-01** | **CISA: "evidence of active exploitation in the wild"** | **🔴 P1** |
-| CVE-2026-43284 / 43500 (Dirty Frag) | **Yes** (root in a single command) | Not listed | Microsoft reported possible in-the-wild activity | 🟠 P2 |
-| CVE-2026-46300 (Fragnesia) | Yes (PoC published alongside disclosure) | Not listed | None reported | 🟠 P2 |
-| CVE-2026-43503 (DirtyClone) | Exploit details published (JFrog) | Not listed | None reported | 🟡 P3 |
+| CVE | Trigger prerequisite | Public PoC | CISA KEV | Active exploitation | Mitigation priority |
+|---|---|---|---|---|---|
+| **CVE-2026-31431 (Copy Fail)** | Local account only (0 steps) | **Yes** (732-byte Python) | **Listed — 2026-05-01** | **CISA: "evidence of active exploitation in the wild"** | **🔴 P1** |
+| CVE-2026-43284 / 43500 (Dirty Frag) | Unprivileged namespace → CAP_NET_ADMIN (1 step) | **Yes** (root in a single command) | Not listed | Microsoft reported possible in-the-wild activity | 🟠 P2 |
+| CVE-2026-46300 (Fragnesia) | Unprivileged namespace → CAP_NET_ADMIN (1 step) | Yes (PoC published alongside disclosure) | Not listed | None reported | 🟠 P2 |
+| CVE-2026-43503 (DirtyClone) | Unprivileged namespace → CAP_NET_ADMIN (1 step) | Exploit details published (JFrog) | Not listed | None reported | 🟠 P2 |
+| CVE-2026-46331 (pedit COW) | Unprivileged namespace → CAP_NET_ADMIN (1 step) | **Yes** (packet_edit_meme, 2026-06-17) | Not listed | None reported | 🟠 P2 |
+| CVE-2026-43494 (PinTheft) | RDS module active + io_uring 6.13+, etc. (2 narrow steps) | Yes (multiple on GitHub) | Not listed | None reported | ⚪ Other |
+| CVE-2026-31694 (FUSE cache overflow) | Kernel 6.16-rc1+, malicious FUSE mount (2 narrow steps) | No confirmed public PoC | Not listed | None reported | ⚪ Other |
 
-`algif_aead` (Copy Fail) is priority #1 for more than just its KEV listing — the ESP/RxRPC paths require creating at least a user/net namespace, while `AF_ALG` sockets require none of that (section 3.2). **If you can only apply a partial mitigation, block `algif_aead` first** — it's usually rarely used in production, so the blast radius is smallest (whereas blocking esp4/esp6 breaks VPNs).
+`algif_aead` (Copy Fail) is priority #1 for more than just its KEV listing — the 4 P2 items (43284/43500/46300/43503/46331) all require creating at least a user/net namespace, while `AF_ALG` sockets require none of that (section 3.2). **If you can only apply a partial mitigation, block `algif_aead` first** — it's usually rarely used in production, so the blast radius is smallest (whereas blocking esp4/esp6 breaks VPNs).
+
+**The 5 P2 items share essentially the same mitigation lever** — blocking unprivileged user/net namespace creation closes the trigger path for all of them (section 3.2). "Dirty Frag" originally named only 43284/43500, but this guide groups 46300/43503/46331 alongside them in practice, since they share the same prerequisite and the same mitigation lever.
+
+**The two "Other" items are rated low not because they're less severe, but because current real-world exposure is narrow.** PinTheft needs a module (RDS) most distros (RHEL/Ubuntu/Debian) don't compile in by default, and the FUSE bug needs a very recent kernel (6.16-rc1+) that major stable distros — including RHEL — don't ship yet (section 2.6, section 2.8, section 4.4). **If your fleet actually uses RDS, or tracks bleeding-edge mainline kernels, re-rate these higher.**
 
 ---
 
@@ -102,15 +118,55 @@
 - **Discovered by**: JFrog Security Research. CVSS 8.8.
 - **Patch**: included from upstream v7.1-rc5 (2026-05-24) onward. It's explicitly stated that only a kernel with the entire "DirtyFrag + Fragnesia chain" is fully protected — backporting the DirtyClone patch alone may not be safe.
 
+### 2.6 pedit COW (CVE-2026-46331)
+
+- **Disclosure**: 2026-06-16. The next day (06-17), researcher Massimiliano Oldani published a public PoC named `packet_edit_meme`.
+- **Path**: the `act_pedit` module — the packet-header-editing action in the traffic control (tc) subsystem.
+- **Root cause**: `tcf_pedit_act()` computes the COW (copy-on-write) target range it passes to `skb_ensure_writable()` **only once, as a hint (`tcfp_off_max_hint`), before the header-editing loop starts.** That hint doesn't account for the offset that typed keys add at runtime, so part of the write region ends up un-COW'd. The header edit then lands directly on the shared page cache. **This is a defect in a different COW mechanism (`skb_ensure_writable()`) than the `SKBFL_SHARED_FRAG` family** — its root code differs from 43284/43500/46300/43503 — but the outcome is the same: the page cache gets misjudged as safe to write.
+- **Trigger condition**: requires `CAP_NET_ADMIN` — typically acquired via an unprivileged user/net namespace (allowed by default on RHEL/Debian/Ubuntu). **Exactly the same prerequisite** as Dirty Frag/Fragnesia/DirtyClone (section 3.2).
+- **Affected versions**: v5.18 through v7.1-rc6 (introduced by commit `899ee91156e5`), fixed in v7.1-rc7.
+- **Vendor response**: Red Hat published a dedicated **RHSB-2026-008** (rated Important). Both module blocking (`act_pedit`) and unprivileged-namespace restriction are officially documented as mitigations — the same pattern as RHSB-2026-003.
+- **CVSS disagreement**: kernel.org rates it 7.8 (`PR:L`) vs. Red Hat's 6.7 (`PR:H`) — the two disagree on the privilege-requirement level. For an operational decision, go by "can CAP_NET_ADMIN be acquired via an unprivileged namespace" rather than the CVSS number alone.
+- **Script support**: [mitigate-cve-2026.sh](mitigate-cve-2026.sh) in this repository does not yet handle `act_pedit`. See section 5.6 for manual mitigation.
+
+### 2.7 PinTheft (CVE-2026-43494)
+
+- **Disclosure**: 2026-05-21 (NVD).
+- **Path**: the combination of the RDS (Reliable Datagram Sockets) zerocopy path and io_uring fixed buffers (`IORING_REGISTER_CLONE_BUFFERS`, kernel 6.13+). Related modules: `rds`/`rds_tcp`/`rds_rdma`.
+- **Root cause**: when `iov_iter_get_pages2()` fails inside `rds_message_zcopy_from_user()`, the pinned pages are released, but the `op_nents` counter isn't reset — so `rds_message_purge()`'s later cleanup loop frees the same page again, a **double-free** (CWE-1341). Chaining this double-free with io_uring fixed buffers lets an attacker reliably overwrite the page-cache copy of a SUID binary.
+- **Trigger condition**: needs a kernel with `CONFIG_RDS`/`CONFIG_RDS_TCP` enabled, and the public PoC requires kernel 6.13+ for io_uring's `IORING_REGISTER_CLONE_BUFFERS`. **Arch Linux is effectively the only mainstream distro that ships the RDS module by default** — RHEL/Debian/Ubuntu don't reach this path out of the box (see the RHEL note below).
+- **RHEL impact**: **officially "Not affected" across RHEL 6–10** (Red Hat Security Data API — `package_state` is Not affected everywhere, no `affected_release` entries). Per CloudLinux's research, RHEL-family kernel configs carry `# CONFIG_RDS is not set` — the module doesn't exist at all, and `socket()` returns `EAFNOSUPPORT` immediately. RHEL 9/10 additionally default to `kernel.io_uring_disabled=2`, disabling io_uring itself.
+- **Mitigation**: on distros where RDS is actually compiled (e.g. Ubuntu), blocking `rds`/`rds_tcp`/`rds_rdma` is documented in the community as a working mitigation (section 5.6). Red Hat's own mitigation field says "no mitigation available / doesn't meet criteria," but this reads as boilerplate stemming from RHEL simply not being affected — don't confuse it with "no mitigation exists anywhere."
+- **Why it's rated low**: the overlapping prerequisites (RDS module + io_uring + a recent kernel) are uncommon enough that this is rated "Other." Re-evaluate upward for HPC/cluster environments that genuinely use RDS.
+
+### 2.8 FUSE directory-cache overflow (CVE-2026-31694)
+
+- **Disclosure**: NVD listed it 2026-05-01. Press coverage spread around 2026-07-10 — more than two months apart (it's usually referred to only by CVE number, with no popular nickname).
+- **Path**: the FUSE (userspace filesystem) directory-entry caching function `fuse_add_dirent_to_cache()`. This is core kernel logic, not a separate protocol module.
+- **Root cause**: a malicious FUSE server can return a directory entry whose serialized size is derived from an **attacker-controlled filename-length field**, and the kernel never checks whether that size fits within `PAGE_SIZE` (4096 bytes). A maximum-sized entry can reach 4120 bytes, overflowing **24 bytes** into the adjacent kernel page (NVD-CWE-noinfo — no detailed CWE assigned). Where 43284 through 46331 fail by "skipping COW," this one fails by "having no boundary check at all" — a **different kind of defect**.
+- **Trigger condition**: a local user needs to be able to interact with a malicious/controlled FUSE server (typically one they mount themselves), and this code path only exists on **kernel 6.16-rc1 or later**.
+- **RHEL impact**: **officially "Not affected" across RHEL 6–10** (`package_state` Not affected everywhere, no `affected_release` entries) — presumably because RHEL kernels don't yet carry the larger-FUSE-readdir-buffer change that makes this reachable.
+- **Mitigation (community guidance, not vendor-official)**: restrict unprivileged FUSE mounts, remove the setuid bit from `fusermount3` (only where FUSE isn't needed at all), and review user-namespace policy. The `fuse` module itself is depended on by sshfs, rclone, and many Snap packages, so its usage footprint is wider than esp4/esp6 — **a blanket module block is not recommended.**
+- **Why it's rated low**: the required kernel version (6.16-rc1+) is ahead of most stable distros as of this writing, so real exposure is currently limited to rolling-release/bleeding-edge-mainline systems. Re-evaluate upward once your distro's kernel line catches up.
+
 ---
 
 ## 3. Shared traits: root cause and structure
 
 ### 3.1 The shared failure mechanism
 
-For performance, the Linux kernel networking stack optimizes socket buffers (`skb`) to reference pages directly instead of copying data (zero-copy). When that page happens to be **file-backed page cache** (an executable's mapping, data delivered via splice, etc.), writing to it carelessly corrupts the file cache itself. To prevent this, flags such as `SKBFL_SHARED_FRAG` mark a fragment as "this is a shared resource — you must copy it (copy-on-write) before modifying."
+For performance, the Linux kernel networking/filesystem stack optimizes to reference pages directly instead of copying data (zero-copy). When that page happens to be **file-backed page cache** (an executable's mapping, data delivered via splice, etc.), writing to it carelessly corrupts the file cache itself. To prevent this, the kernel places safeguards at each code path — flags such as `SKBFL_SHARED_FRAG` marking "this is shared — copy it (copy-on-write) before modifying," or bounds checks limiting how much may be written.
 
-All 5 CVEs are the **same class of bug** — this flag being lost or mishandled along some path (fragmentation, cloning, reassembly, AEAD cipher operations). This mistake recurred independently across subsystems (ESP, RxRPC, AF_ALG) and code paths (initial processing vs. cloning vs. reassembly), earning separate CVE numbers each time.
+**The 8 CVEs share the same outcome, but not a single technical root cause** — they split into at least 4 families:
+
+| Defect family | Mechanism | CVEs |
+|---|---|---|
+| Loss of the `SKBFL_SHARED_FRAG` flag | The flag marking an skb fragment as referencing a shared/file-backed page fails to propagate through fragmentation, coalescing, cloning, or reassembly | 43284, 43500, 46300, 43503 |
+| Reverted AEAD in-place optimization | A 2017 performance optimization made cipher operations run in place on file-backed pages | 31431 |
+| `skb_ensure_writable()` COW-range miscalculation | The COW target range is computed once (incorrectly) before the edit loop, leaving part of the write region un-COW'd | 46331 |
+| One-off defects (double-free, missing bounds check) | An uninitialized RDS zerocopy counter causing a double-free; an unchecked FUSE entry size causing an overflow — unrelated bugs that both happen to land writes in the page cache | 43494, 31694 |
+
+In other words, the "shared trait" in this guide isn't a single bug with several variants — it's **the same failure pattern ("treat a file-backed page as unsafe to write") recurring independently across different corners of the kernel** (see the lineage in section 3.3). `SKBFL_SHARED_FRAG` loss is simply the largest sub-family (4 CVEs), not a mechanism that represents all 8.
 
 ### 3.2 A common misconception: "we don't use this feature" is not safety
 
@@ -119,7 +175,7 @@ Section 2's "path / trigger condition" describes **which subsystem the vulnerabl
 - **Policy-level non-use** (the administrator never configured IPsec/VPN/AF_ALG) means nothing to the kernel. On an unpatched kernel, the vulnerable code is still present on the server.
 - **Only technical unreachability** (the code doesn't exist, or its call path is blocked) provides an actual defense.
 
-`algif_aead` (Copy Fail) is completely unrelated to IPsec/VPN configuration — `socket(AF_ALG, SOCK_SEQPACKET, 0)` can be called by any local account with no permission check whatsoever. The `esp4`/`esp6`/`rxrpc` paths normally require `CAP_NET_ADMIN` for legitimate use, but inside an unprivileged user/net namespace (`unshare -Un`, etc.) — which most distros allow by default — an ordinary account can effectively reach that code with administrator-equivalent privilege. In short: **once a low-privileged account is already compromised, an attacker can invoke the feature directly and exploit the vulnerability regardless of the administrator's "we don't use it" policy.**
+`algif_aead` (Copy Fail) is completely unrelated to IPsec/VPN configuration — `socket(AF_ALG, SOCK_SEQPACKET, 0)` can be called by any local account with no permission check whatsoever. The `esp4`/`esp6`/`rxrpc`/`act_pedit` (pedit COW) paths normally require `CAP_NET_ADMIN` for legitimate use, but inside an unprivileged user/net namespace (`unshare -Un`, etc.) — which most distros allow by default — an ordinary account can effectively reach that code with administrator-equivalent privilege. In short: **once a low-privileged account is already compromised, an attacker can invoke the feature directly and exploit the vulnerability regardless of the administrator's "we don't use it" policy.** All 5 P2 items (43284/43500/46300/43503/46331) fall under this exact logic, so **a single unprivileged user/net namespace restriction is a lever effective against all 5 at once** (see section 5.6 — though 46331 isn't automated by the script yet and needs manual application).
 
 This is why blocking modules (`install ... /bin/false`) in [mitigate-cve-2026.sh](mitigate-cve-2026.sh) provides real defense — it's a technical measure that makes the kernel's module-autoload mechanism (`request_module()`) itself fail, **rendering the code path fundamentally unreachable regardless of the caller's privilege level.** By the same logic, this defense doesn't work when the target code is built in (`=y`) — there is no "load step" to block in the first place (section 5.5).
 
@@ -136,6 +192,44 @@ RHEL/CentOS being exempt for RxRPC (43500) and someone claiming an exemption bec
 
 Red Hat has officially documented the reason as well. Per its security-data statement, RHEL 9/10 kernel source configs include rxrpc, but **Red Hat does not ship or support a binary RPM providing this module.** It is not installed by default and is absent from both the supported kernel packages and RHCOS images. Oracle Linux (UEK) is the same, with `# CONFIG_AF_RXRPC is not set`.
 
+#### Trigger path at a glance
+
+The diagram below summarizes the point made above: the number of prerequisite steps determines priority — fewer steps required of the attacker means a higher priority.
+
+```mermaid
+flowchart TD
+    START["Unprivileged local account"]
+
+    START --> P1PATH["Open an AF_ALG socket<br/>socket AF_ALG, SOCK_SEQPACKET"]
+    P1PATH --> P1["Copy Fail 31431<br/>0 prerequisite steps — no namespace needed"]
+
+    START --> NSSTEP["Create an unprivileged<br/>user/net namespace via unshare -Un etc."]
+    NSSTEP --> CAPSTEP["Acquire CAP_NET_ADMIN<br/>inside the namespace"]
+    CAPSTEP --> P2["Dirty Frag 43284/43500 · Fragnesia 46300<br/>DirtyClone 43503 · pedit COW 46331<br/>1 prerequisite step"]
+
+    START --> NARROW["RDS module + io_uring 6.13 or later<br/>or kernel 6.16-rc1 or later + malicious FUSE mount"]
+    NARROW --> OTHER["PinTheft 43494 · FUSE cache overflow 31694<br/>2 prerequisite steps — narrow target population"]
+
+    P1 --> SINK["Reach the vulnerable zero-copy code path<br/>COW skipped / missing bounds check / etc."]
+    P2 --> SINK
+    OTHER --> SINK
+
+    SINK --> WRITE["In-place write into the page cache"]
+    WRITE --> ROOT["Tamper with a SUID binary's in-memory cache copy<br/>root gained, no trace on disk or in audit logs"]
+
+    classDef p1 fill:#f8d7da,stroke:#c0392b,stroke-width:2px,color:#000
+    classDef p2 fill:#fde9d0,stroke:#e07b1f,stroke-width:2px,color:#000
+    classDef other fill:#e8e8e8,stroke:#777777,stroke-width:2px,color:#000
+    classDef sink fill:#fff3cd,stroke:#b8860b,stroke-width:1px,color:#000
+
+    class P1 p1
+    class P2 p2
+    class OTHER other
+    class SINK,WRITE,ROOT sink
+```
+
+**How to read this**: all three paths converge on the same outcome — "in-place page-cache write → root" — but differ in how many prerequisite steps it takes to get there. Copy Fail needs nothing but opening a socket (0 steps), so it's P1. The 5 P2 items all have to pass through the same single gate — creating a namespace (1 step, exactly the logic in section 3.2). The 2 "Other" items need that same gate plus additional module/kernel-version prerequisites (2 steps). This diagram is also why **a single unprivileged-namespace restriction in this mitigation script is effective against all 5 P2 items at once** — they all have to pass through the same gate.
+
 ### 3.3 Lineage: why this class of bug keeps recurring
 
 This family extends a long-running lineage of "page cache in-place write" vulnerabilities in the Linux kernel.
@@ -147,12 +241,18 @@ Dirty Pipe (2022, CVE-2022-0847)
    └─ missing pipe-buffer flag initialization allows direct page-cache overwrite
 Dirty Cred
    └─ kernel credential-object reuse flaw
-Dirty Frag family (2026)
-   └─ SKBFL_SHARED_FRAG flag lost along skb fragment/clone paths
-      → Copy Fail, Dirty Frag (ESP/RxRPC), Fragnesia, DirtyClone
+Dirty Frag family (2026, SKBFL_SHARED_FRAG loss)
+   └─ Copy Fail (31431, joined the family via a reverted AEAD in-place optimization)
+   └─ Dirty Frag/ESP (43284), Dirty Frag/RxRPC (43500)
+   └─ Fragnesia (46300, skb_try_coalesce())
+   └─ DirtyClone (43503, __pskb_copy_fclone())
+   └─ pedit COW (46331, skb_ensure_writable() COW-range miscalculation — different mechanism, same outcome)
+Unrelated page-cache defects (2026, no connection to the above)
+   └─ PinTheft (43494, RDS zerocopy double-free + io_uring)
+   └─ FUSE cache overflow (31694, unchecked directory-entry boundary)
 ```
 
-Key takeaway: the pattern of "an in-place write happening by mistake where a copy should have occurred" is itself a structurally recurring bug class in Linux's networking/memory subsystems. Rather than expecting one complete fix to end it permanently, assume **further variants are likely to keep surfacing** as related paths are discovered.
+Key takeaway: the pattern of "an in-place write happening by mistake where a copy should have occurred" is itself a structurally recurring bug class in Linux's networking/memory subsystems. Rather than expecting one complete fix to end it permanently, assume **further variants are likely to keep surfacing** as related paths are discovered. The fact that PinTheft and the FUSE bug are technically unrelated to the `SKBFL_SHARED_FRAG` family yet were discovered independently around the same time, with the same outcome (in-place page-cache tampering), shows this isn't a single flag's problem — it's **a structural risk recurring across every zero-copy optimization point in the kernel.**
 
 The structural problem worth noting is that **the places in the kernel that must preserve the `SKBFL_SHARED_FRAG` flag are scattered widely**: fragmentation (43284), coalescing via `skb_try_coalesce()` (46300), cloning via `__pskb_copy_fclone()` (43503), and per-protocol reassembly (43500) — fixing one leaves the others exposed. Fragnesia only becoming exploitable after the 43284 patch (section 2.4) also shows that fixing one path can **expose or activate** a latent flaw in another.
 
@@ -168,27 +268,29 @@ The structural problem worth noting is that **the places in the kernel that must
 
 ### 4.1 Understand the "chain" concept — this is not a single patch
 
-The 5 CVEs are 5 distinct commits. For "we updated the kernel" to actually guarantee safety, the running version must include all 5.
+The original 5 CVEs are 5 distinct commits. For "we updated the kernel" to actually guarantee safety, the running version must include all 5.
 
 - Copy Fail has a different root code path from the rest and **must always be verified independently.**
 - Dirty Frag (ESP) and Dirty Frag (RxRPC) share a name but are **separate commits.**
 - Fragnesia is a flaw on a separate path that only becomes exploitable once the 43284 patch is applied, so a kernel with 43284 but not 46300 remains vulnerable (section 2.4).
 - DirtyClone's precondition for full protection is the entire "DirtyFrag + Fragnesia chain."
 
+**The 3 additionally identified CVEs (pedit COW/PinTheft/FUSE) are not part of this 5-commit chain.** Patching all 5 above does not resolve these 3, and patching these 3 does not complete the original chain either — verify each CVE ID independently. Note that pedit COW and PinTheft also show a Fragnesia-like split between "vulnerable since" and "actually exploitable since" (section 2.6, section 2.7, section 4.3).
+
 ### 4.2 Don't judge patch status by version comparison alone
 
 Comparing the `uname -r` version string against the upstream fix version is **not reliable on distro kernels.** Ubuntu/RHEL/Debian and others frequently keep the upstream version number while backporting the security fix separately.
 
 **Recommended verification procedure**:
-1. Search each of the 5 CVE IDs against your distro's security advisories (Ubuntu USN, RHEL RHSA, Debian DSA, SUSE-SU, etc.).
+1. Search each of the 8 CVE IDs against your distro's security advisories (Ubuntu USN, RHEL RHSA, Debian DSA, SUSE-SU, etc.).
 2. Check the package's change history:
    - Debian/Ubuntu: `apt changelog linux-image-$(uname -r)`, then grep for the CVE ID
    - RHEL/CentOS/Fedora: `rpm -q --changelog kernel-$(uname -r)`, then grep for the CVE ID
    - SUSE: cross-check the corresponding SUSE-SU advisory
-3. Only conclude "fully patched" once **all 5** CVE IDs are confirmed.
+3. Only conclude "fully patched" once **all 5** of the original CVE IDs are confirmed. pedit COW/PinTheft/FUSE are a separate chain — verify each individually.
 4. Use automated tooling where available: Ubuntu's `ubuntu-security-status` / `pro fix CVE-XXXX --dry-run`, RHEL's `oscap`, etc.
 
-**[mitigate-cve-2026.sh](mitigate-cve-2026.sh) automates steps 2–3 above** — checking `rpm -q --changelog` on Red Hat family and dpkg changelogs on Debian/Ubuntu family (section 5.1).
+**[mitigate-cve-2026.sh](mitigate-cve-2026.sh) automates steps 2–3 above — but only for the original 5 CVEs.** It checks `rpm -q --changelog` on Red Hat family and dpkg changelogs on Debian/Ubuntu family (section 5.1). pedit COW/PinTheft/FUSE aren't checked by the script yet, so apply the procedure above manually (section 5.6).
 
 #### When the changelog has no CVE ID
 
@@ -232,10 +334,15 @@ Separately from searching by CVE ID, if you want to know exactly which version r
 | CVE-2026-43500 (Dirty Frag/RxRPC) | 5.3 | 6.6.140 / 6.12.88 / 6.18.29 / 7.0.6 |
 | CVE-2026-46300 (Fragnesia) | 3.9 | 5.10.257 / 5.15.208 / 6.1.174 / 6.6.141 / 6.12.91 / 6.18.33 / 7.0.10 (7.1-rc1–rc4 also vulnerable) |
 | CVE-2026-43503 (DirtyClone) | 3.9 | 5.10.257 / 5.15.208 / 6.1.174 / 6.6.141 / 6.12.91 / 6.18.33 / 7.0.10 (7.1-rc1–rc4 also vulnerable) |
+| CVE-2026-46331 (pedit COW) | 5.18 | v7.1-rc7 (branch-by-branch point releases not yet compiled here — check your distro's advisory individually) |
+| CVE-2026-43494 (PinTheft) | 4.17 (code defect present since) | 5.10.257 / 5.15.208 / 6.1.174 / 6.6.140 / 6.12.90 / 6.18.32 / 7.0.9 — **but the public exploit needs io_uring's `IORING_REGISTER_CLONE_BUFFERS`, so real exploitability only starts at kernel 6.13** (a Fragnesia-like split between "vulnerable since" and "exploitable since," section 2.7) |
+| CVE-2026-31694 (FUSE cache overflow) | 4.20 (code defect present since) | 5.10.258 / 5.15.209 / 6.1.175 / 6.6.136 / 6.18.25 / 7.0.2 — **but real reachability via large readdir buffers only starts at kernel 6.16-rc1** (same pattern, section 2.8) |
 
-**How to read this**: each branch is backported to its own separate point release (e.g. "below 6.1.171" only applies within the 6.1 line), so check the point-release number on your own branch, not just the major version. Taken together, the combined theoretical exposure window across all 5 CVEs spans kernel **3.9 to 7.1-rc4**, with Fragnesia/DirtyClone reaching back to the oldest kernels.
+**How to read this**: each branch is backported to its own separate point release (e.g. "below 6.1.171" only applies within the 6.1 line), so check the point-release number on your own branch, not just the major version. Taken together, the combined theoretical exposure window across the original 5 CVEs spans kernel **3.9 to 7.1-rc4**, with Fragnesia/DirtyClone reaching back to the oldest kernels.
 
 > The fact that 46300 and 43503 share the same point release per branch is not a typo — the two landed together in the same stable release cycle.
+
+> **Don't conflate "vulnerable since" with "actually exploitable since."** PinTheft and the FUSE cache overflow have old underlying defects (since 4.17 and 4.20 respectively), but actually weaponizing them requires a **later, unrelated kernel feature** — io_uring fixed buffers (6.13+) and large FUSE readdir buffers (6.16-rc1+) respectively. This is the same structure as Fragnesia becoming exploitable only after the 43284 patch (section 2.4) — don't assume "it's an old kernel, so it's safe."
 
 ### 4.4 RHEL/CentOS family details
 
@@ -253,6 +360,9 @@ Separately from searching by CVE ID, if you want to know exactly which version r
 | 43500 (Dirty Frag/RxRPC) | **Not affected** | **Not affected** | **Not affected** | **Not affected** — RHSB-2026-003 explicitly states "does not affect Red Hat products" |
 | 46300 (Fragnesia) | **Not affected** | Affected | Affected | Affected |
 | 43503 (DirtyClone) | **Not affected** | **Affected** → RHSA-2026:19666 (kernel) / 19664 (kernel-rt) | Affected (CVSS 7.0) | Affected |
+| 46331 (pedit COW) | **Not affected** | Affected → `kernel-4.18.0-553.143.1.el8_10` (RHSA-2026:27353) | Affected (RHSB-2026-008) | Affected → `kernel-6.12.0-211.26.1.el10_2` (RHSA-2026:27288) |
+| 43494 (PinTheft) | **Not affected** | **Not affected** | **Not affected** | **Not affected** — `package_state` Not affected across all products, no `affected_release` entries. CONFIG_RDS itself is absent from RHEL kernels (section 2.7) |
+| 31694 (FUSE cache overflow) | **Not affected** | **Not affected** | **Not affected** | **Not affected** — `package_state` Not affected everywhere. Presumably because the large-FUSE-readdir-buffer change isn't present (section 2.8) |
 
 > **Don't compare version numbers across rows.** The `kernel-6.12.0-211.16.1.el10_2` (10.2 stream) in the table above and `kernel-6.12.0-124.56.1.el10_1` (10.1 stream) below are on **different minor streams**, so comparing the numeric size directly is invalid (`124` < `211` does not mean el10_1 is the lower version). RHEL maintains an independent kernel line per minor release, so only compare versions **within the same stream** you're actually on (`el9_7`, `el10_1`, `el10_2`, etc.).
 >
@@ -302,6 +412,8 @@ The only "not affected" exemption [mitigate-cve-2026.sh](mitigate-cve-2026.sh) h
 ## 5. Production environments that can't patch immediately — using the mitigation script
 
 Production fleets often need time for change approval and a maintenance window before a reboot or kernel swap. [mitigate-cve-2026.sh](mitigate-cve-2026.sh) can bridge that gap as a temporary **compensating control**. **Recognize clearly that this does not replace the patch — it only reduces attack surface until the patch can be applied.**
+
+> **Scope note**: this section (5.1–5.5) covers only the **original 5 CVEs** (31431/43284/43500/46300/43503) that the script actually automates. The 3 additionally identified CVEs — pedit COW (46331), PinTheft (43494), and the FUSE cache overflow (31694) — are not yet handled by the script; manual mitigation steps for those are in section 5.6.
 
 ### 5.1 What the script covers
 
@@ -397,6 +509,41 @@ For asset scanning, run `--dry-run` and collect only hosts with exit code `10`. 
 - **`--yes` does not replace human impact assessment.** This flag exists to "reapply an already-reviewed decision consistently across a server group," not to greenlight blanket application to unreviewed infrastructure. Collect the target list with `--dry-run` first, confirm IPsec/AF_ALG usage, and only then use `--yes`.
 - **Blocking cannot immediately disable a module that's already loaded and in use.** If `modprobe -r` fails (refcount > 0), that module stays in memory until reboot. The script explicitly warns about this, but if immediate mitigation is required, stop the service using that feature first.
 
+### 5.6 The 3 CVEs the script doesn't cover — manual mitigation
+
+pedit COW (46331), PinTheft (43494), and the FUSE cache overflow (31694) are not yet automated by [mitigate-cve-2026.sh](mitigate-cve-2026.sh). Below are vendor- and community-documented manual procedures. **Confirm actual usage before applying anything, following the same principle as section 5.2** — there is no automatic pre-check, usage-signal detection, or rollback safety net here, so proceed more cautiously than with sections 5.1–5.5.
+
+#### pedit COW (CVE-2026-46331)
+
+This shares the exact same prerequisite as the P2 group (43284/43500/46300/43503) — an unprivileged namespace to acquire CAP_NET_ADMIN — so **if you've already applied this script's namespace restriction, pedit COW is likely already blocked too.** To block only the module (Red Hat's official **RHSB-2026-008** procedure):
+
+```bash
+echo "blacklist act_pedit" > /etc/modprobe.d/blacklist-act-pedit.conf
+lsmod | grep -qw act_pedit && rmmod act_pedit
+```
+
+> ⚠️ Not suitable for systems that actually use tc pedit rules for traffic shaping or packet-header rewriting (RHSB-2026-008 states this explicitly). Confirm actual usage first with `tc filter show` / `tc actions show action pedit`, etc.
+
+#### PinTheft (CVE-2026-43494)
+
+**RHEL/CloudLinux family is already not affected** (CONFIG_RDS is absent entirely, section 2.7) — this procedure only applies to distros where RDS is actually compiled in (e.g. Ubuntu).
+
+```bash
+printf 'install rds /bin/false\ninstall rds_tcp /bin/false\ninstall rds_rdma /bin/false\n' > /etc/modprobe.d/pintheft.conf
+rmmod rds_tcp 2>/dev/null; rmmod rds_rdma 2>/dev/null; rmmod rds 2>/dev/null
+true
+```
+
+To revert: `rm /etc/modprobe.d/pintheft.conf`, then `modprobe rds` if needed. If your systems run kernel 6.13+ with io_uring in active use, consider re-rating this higher (see the "Other" re-evaluation criteria in section 1.1).
+
+#### FUSE cache overflow (CVE-2026-31694)
+
+The `fuse` module is depended on by sshfs, rclone, and many Snap packages, so its blast radius is wider than esp4/esp6 — **a blanket module block is not recommended.** Instead:
+
+- On systems that never use FUSE at all, remove the setuid bit from `fusermount3`: `chmod u-s /usr/bin/fusermount3` (this disables FUSE entirely for unprivileged users, so confirm actual usage first)
+- Restrict unprivileged FUSE mounts by policy (review `user_allow_other` in `/etc/fuse.conf`; pair with unprivileged user/net namespace restriction)
+- Fundamentally, this CVE only manifests on kernel 6.16-rc1 and later, so systems not yet on that kernel line are not currently exposed (section 2.8) — if you plan to move to kernel 6.16+, check whether the fix is included at that point.
+
 ---
 
 ## 6. Checklist
@@ -412,6 +559,9 @@ For asset scanning, run `--dry-run` and collect only hosts with exit code `10`. 
 - [ ] Did you run the mitigation script's pre-check (dry-run) first and review the full step 0 through 0-3 output?
 - [ ] Did you prepare the change-management approval and logging procedure?
 - [ ] Did you set a separate target date for applying the official patch?
+- [ ] **Did you also check patch status for the 3 additional CVEs (pedit COW/PinTheft/FUSE)?** — the script doesn't check these automatically; verify manually against distro advisories (section 1, sections 2.6–2.8)
+- [ ] Did you confirm whether pedit COW (46331) is already covered by the same namespace restriction applied to the P2 group, or whether `act_pedit` is actually in use and needs separate handling? (section 5.6)
+- [ ] Did you confirm whether "Other"-tier prerequisites (RDS for PinTheft, kernel 6.16+ for FUSE) actually exist in your fleet, and re-rate priority upward if so? (section 1.1)
 
 ---
 
@@ -437,6 +587,27 @@ For asset scanning, run `--dry-run` and collect only hosts with exit code `10`. 
 - [RHSB-2026-003 - Dirty Frag/Fragnesia - Red Hat](https://access.redhat.com/security/vulnerabilities/RHSB-2026-003)
 - [Dirty Frag: LPE via ESP and RxRPC - Wiz](https://www.wiz.io/blog/dirty-frag-linux-kernel-local-privilege-escalation-via-esp-and-rxrpc)
 - [Copy Fail (CVE-2026-31431): FAQ - Tenable](https://www.tenable.com/blog/copy-fail-cve-2026-31431-frequently-asked-questions-about-linux-kernel-privilege-escalation)
+
+**The 3 additionally identified CVEs (sections 2.6–2.8, section 5.6)**
+
+- [RHSB-2026-008 - Traffic Control Privilege Escalation - Red Hat](https://access.redhat.com/security/vulnerabilities/RHSB-2026-008)
+- [pedit COW (CVE-2026-46331): Mitigation and Kernel Update - CloudLinux](https://blog.cloudlinux.com/pedit-cow-mitigation-and-kernel-update)
+- [New Linux pedit COW Exploit Enables Root Access by Poisoning Cached Binaries - The Hacker News](https://thehackernews.com/2026/06/new-linux-pedit-cow-exploit-enables.html)
+- [pedit COW & DirtyClone: Two New Linux Root Exploits That Bypass On-Disk Integrity Checks - Hive Security](https://hivesecurity.gitlab.io/blog/linux-lpe-pedit-cow-dirtyclone-2026/)
+- [pedit-cow (CVE-2026-46331): Linux tc Flaw Grants Root - TuxCare](https://tuxcare.com/blog/pedit-cow-cve/)
+- [PinTheft CVE-2026-43494, Linux RDS to Root Through Page Cache - Penligent](https://www.penligent.ai/hackinglabs/pintheft-cve-2026-43494-linux/)
+- [PinTheft (CVE-2026-43494) kernel LPE: CloudLinux platforms are not affected - CloudLinux](https://blog.cloudlinux.com/pintheft-cloudlinux-platforms-not-affected)
+- [CVE-2026-43494 Linux RDS Double Free: PinTheft LPE Risk and Mitigations - Windows Forum](https://windowsforum.com/threads/cve-2026-43494-linux-rds-double-free-pintheft-lpe-risk-and-mitigations.419282/)
+- [Linux FUSE Page Cache Overflow Lets Local Attackers Gain Root Access - CyberPress](https://cyberpress.org/linux-fuse-page-cache-overflow/)
+- [Copy Fail and Its Descendants: A Real Human's Guide to Kernel Page-Cache LPEs - VulnCheck](https://www.vulncheck.com/blog/copy-fails-descendants-recent-linux-lpes)
+- [NVD - CVE-2026-46331](https://nvd.nist.gov/vuln/detail/CVE-2026-46331)
+- [NVD - CVE-2026-43494](https://nvd.nist.gov/vuln/detail/CVE-2026-43494)
+- [NVD - CVE-2026-31694](https://nvd.nist.gov/vuln/detail/CVE-2026-31694)
+- [Red Hat Security Data API - CVE-2026-46331](https://access.redhat.com/hydra/rest/securitydata/cve/CVE-2026-46331.json)
+- [Red Hat Security Data API - CVE-2026-43494](https://access.redhat.com/hydra/rest/securitydata/cve/CVE-2026-43494.json)
+- [Red Hat Security Data API - CVE-2026-31694](https://access.redhat.com/hydra/rest/securitydata/cve/CVE-2026-31694.json)
+
+> **CVEs reviewed but excluded from this document's scope**: CVE-2026-23111 (nf_tables UAF — a different kernel data-structure defect, not page-cache), CVE-2026-46242 (Bad Epoll — unrelated to page cache, and no mitigation exists at all), CVE-2026-53359 (Januscape/KVM shadow paging — MMU second-level page tables, not the VFS page cache), CVE-2026-64600 (RefluXFS — the opposite failure mode: O_DIRECT bypasses the page cache and corrupts disk directly). See this conversation's history for the detailed reasoning behind each exclusion.
 
 **Threat-status sources (basis for section 1.1)**
 
