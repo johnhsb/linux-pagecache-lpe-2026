@@ -77,7 +77,7 @@ For root-cause details, patch commits, version ranges, RHEL specifics, and manua
 - **Distinguishes "unused" from "unknown"** — detection failures are never collapsed into "no signal," which would risk misreading an IPsec-using server as unused and cutting its VPN.
 - **Usage-signal detection (heuristic)** — checks `ip xfrm`, IKE ports, strongswan/libreswan, AFS mounts, container runtimes.
 - **Conclusion-first output, offline by default** — the default output is a ~20-line diagnosis-and-action summary; rationale is behind `--verbose`, network access behind `--online`.
-- **Idempotent + reversible + automatable** — reruns are stable, `--rollback` restores prior state (including original sysctl values), and meaningful exit codes wire into Ansible/CI.
+- **Idempotent + reversible + automatable** — reruns are stable, `--rollback` restores prior state (including original sysctl values), and meaningful exit codes wire into [Ansible/CI](#ansible-integration).
 
 ---
 
@@ -105,6 +105,55 @@ For root-cause details, patch commits, version ranges, RHEL specifics, and manua
 | `20` | Changes were actually applied |
 
 In Ansible, pair `--yes` with `failed_when: rc not in [0, 20]`.
+
+### Ansible integration
+
+The script's exit codes are designed to map directly onto Ansible's `changed_when`/`failed_when`.
+
+**1. Bulk apply**
+```yaml
+- name: Apply Dirty Frag family mitigation
+  ansible.builtin.command: bash /opt/mitigate-cve-2026.sh --yes
+  register: mitigate
+  changed_when: mitigate.rc == 20
+  failed_when: mitigate.rc not in [0, 20]
+```
+`rc==20` (changes applied) maps to `changed`; `rc==0` (already safe / no action needed) is a no-op success; anything else fails the task.
+
+**2. Pre-scan (identify targets without changing anything)**
+```yaml
+- name: Check whether action is needed (no changes)
+  ansible.builtin.command: bash /opt/mitigate-cve-2026.sh --dry-run --yes
+  register: precheck
+  changed_when: false
+  failed_when: precheck.rc not in [0, 10]
+```
+Collect only hosts with `rc==10` to build your rollout target list.
+
+**3. Rollback**
+```yaml
+- name: Revert the mitigation
+  ansible.builtin.command: bash /opt/mitigate-cve-2026.sh --rollback --yes
+  register: rollback
+```
+
+**Caveats**
+- **The namespace restriction (built-in mitigation) is never auto-applied, even with `--yes`** — it's deliberately excluded from unattended automation because of its impact. Those hosts need individual interactive approval.
+- Idempotent, so reruns are safe — but **rerunning after a kernel patch automatically lifts the block for that CVE's module**. Account for this if the playbook reruns on a schedule.
+- Requires root. In non-interactive contexts, pass `--yes` or `--dry-run` to avoid hitting an interactive prompt.
+- **Don't apply to the whole inventory at once — validate on 1-2 canary hosts first.** Roll out in small batches with `serial` and confirm there's no service impact (IPsec/VPN drops, AF_ALG disruption, etc.) before expanding to the rest of the fleet (same recommendation as guide section 5.4, "Phased rollout").
+  ```yaml
+  - hosts: patch_targets
+    serial: "10%"
+    tasks:
+      - name: Apply Dirty Frag family mitigation
+        ansible.builtin.command: bash /opt/mitigate-cve-2026.sh --yes
+        register: mitigate
+        changed_when: mitigate.rc == 20
+        failed_when: mitigate.rc not in [0, 20]
+  ```
+
+For full procedures, see sections 5.3–5.4 of [pagecache-lpe-guide.en.md](pagecache-lpe-guide.en.md).
 
 ### Distro "not affected" determination
 

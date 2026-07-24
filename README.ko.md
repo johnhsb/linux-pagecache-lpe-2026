@@ -77,7 +77,7 @@ sudo bash mitigate-cve-2026.sh --rollback   # 3) 필요 시 원복
 - **"미사용"과 "확인불가"를 구분** — 탐지 실패를 신호 없음으로 뭉뚱그리지 않아, IPsec 사용 서버를 미사용으로 오판해 VPN을 끊는 사고를 방지.
 - **사용 신호 탐지(휴리스틱)** — `ip xfrm`, IKE 포트, strongswan/libreswan, AFS 마운트, 컨테이너 런타임 확인.
 - **결론 중심 출력, 기본 오프라인** — 기본은 진단·조치 요약만 20줄 내외, 근거는 `--verbose`, 네트워크는 `--online`으로 분리.
-- **멱등 + 원복 + 자동화** — 재실행해도 결과 동일, `--rollback`으로 원복(sysctl 원래 값 복원), 종료 코드로 Ansible/CI 연동.
+- **멱등 + 원복 + 자동화** — 재실행해도 결과 동일, `--rollback`으로 원복(sysctl 원래 값 복원), 종료 코드로 [Ansible/CI 연동](#ansible-연동).
 
 ---
 
@@ -105,6 +105,55 @@ sudo bash mitigate-cve-2026.sh --rollback   # 3) 필요 시 원복
 | `20` | 변경을 실제로 적용함 |
 
 Ansible에서는 `--yes`와 함께 `failed_when: rc not in [0, 20]` 식으로 연결.
+
+### Ansible 연동
+
+스크립트는 종료 코드로 상태를 구분하도록 설계되어 있어 `changed_when`/`failed_when`과 바로 연결된다.
+
+**1. 일괄 적용**
+```yaml
+- name: Dirty Frag 계열 완화 적용
+  ansible.builtin.command: bash /opt/mitigate-cve-2026.sh --yes
+  register: mitigate
+  changed_when: mitigate.rc == 20
+  failed_when: mitigate.rc not in [0, 20]
+```
+`rc==20`(변경 적용)은 `changed`, `rc==0`(이미 안전/조치 불필요)은 변경 없음, 그 외는 실패 처리.
+
+**2. 사전 스캔(변경 없이 대상만 추리기)**
+```yaml
+- name: 조치 필요 여부만 점검 (변경 없음)
+  ansible.builtin.command: bash /opt/mitigate-cve-2026.sh --dry-run --yes
+  register: precheck
+  changed_when: false
+  failed_when: precheck.rc not in [0, 10]
+```
+`rc==10`인 호스트만 조치 대상으로 수집해 이후 롤아웃 대상 목록을 만들 수 있다.
+
+**3. 원복**
+```yaml
+- name: 완화 조치 원복
+  ansible.builtin.command: bash /opt/mitigate-cve-2026.sh --rollback --yes
+  register: rollback
+```
+
+**주의**
+- **네임스페이스 제한(빌트인 대응)은 `--yes`로도 자동 적용되지 않는다** — 영향이 커서 의도적으로 무인 자동화 대상에서 제외됨. 해당 서버는 대화형으로 개별 승인 필요.
+- 멱등적이라 재실행은 안전하지만, **커널 패치 후 재실행하면 해당 CVE 모듈의 차단이 자동 해제**된다 — 정기 재실행 파이프라인이라면 이 점을 감안할 것.
+- root 권한 필요. 비대화형 환경에서는 `--yes` 또는 `--dry-run`이 필수(대화형 프롬프트가 뜨는 상황을 방지).
+- **전체 인벤토리에 일괄 적용하지 말고 카나리아 서버 1~2대로 먼저 검증할 것.** `serial`로 소규모 배치부터 적용해 서비스 영향(IPsec/VPN 단절, AF_ALG 사용 중단 등)이 없는지 확인한 뒤 나머지 호스트로 확대한다(가이드 5.4절 "단계적 롤아웃"과 동일 권장사항).
+  ```yaml
+  - hosts: patch_targets
+    serial: "10%"
+    tasks:
+      - name: Dirty Frag 계열 완화 적용
+        ansible.builtin.command: bash /opt/mitigate-cve-2026.sh --yes
+        register: mitigate
+        changed_when: mitigate.rc == 20
+        failed_when: mitigate.rc not in [0, 20]
+  ```
+
+더 자세한 절차는 [pagecache-lpe-guide.ko.md](pagecache-lpe-guide.ko.md) 5.3~5.4절 참고.
 
 ### 배포판 "해당없음" 판정
 
